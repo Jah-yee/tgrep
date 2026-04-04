@@ -36,13 +36,20 @@ pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) 
         walk.skipped_error
     );
 
-    // Read all files and extract trigrams with masks in parallel
+    // Read all files and extract trigrams with masks in parallel.
+    // Binary content check is done here (not in walker) to avoid an extra
+    // 8KB read per file — we're already reading the full file anyway.
     eprintln!("Extracting trigrams...");
+    let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
     let file_data: Vec<(String, Vec<(u32, TrigramMasks)>)> = walk
         .files
         .par_iter()
         .filter_map(|path| {
             let data = std::fs::read(path).ok()?;
+            if trigram::is_binary(&data) {
+                binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
             let rel = path
                 .strip_prefix(&root)
                 .unwrap_or(path)
@@ -58,6 +65,13 @@ pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) 
             Some((rel, tri_masks))
         })
         .collect();
+    let extra_binary = binary_skipped.into_inner();
+    if extra_binary > 0 {
+        eprintln!(
+            "Skipped {} additional binary files (detected by content)",
+            extra_binary
+        );
+    }
 
     // Assign file IDs and build inverted index with masks
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(file_data.len());

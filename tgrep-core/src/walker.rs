@@ -1,10 +1,6 @@
 /// .gitignore-aware file walker using the `ignore` crate (same as ripgrep).
 use ignore::WalkBuilder;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-use crate::trigram;
 
 /// Maximum file size to index (1 MB). Larger files are skipped.
 const MAX_FILE_SIZE: u64 = 1_048_576;
@@ -42,83 +38,63 @@ fn is_binary_extension(path: &Path) -> bool {
         })
 }
 
-/// Read only the first 8KB of a file to check for binary content.
-fn is_binary_file(path: &Path) -> std::io::Result<bool> {
-    let mut f = File::open(path)?;
-    let mut buf = [0u8; 8192];
-    let n = f.read(&mut buf)?;
-    Ok(trigram::is_binary(&buf[..n]))
-}
-
 /// Walk a directory tree, respecting .gitignore rules (unless disabled).
 /// Returns paths of text files suitable for indexing/searching.
+///
+/// Only rejects files by extension and size here. Content-based binary
+/// detection is deferred to the caller (which reads the file anyway),
+/// avoiding an extra 8KB read per file during the walk.
 pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
-    let mut files = Vec::new();
-    let mut skipped_binary = 0;
-    let mut skipped_error = 0;
+    let files = std::sync::Mutex::new(Vec::new());
+    let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
+    let skipped_error = std::sync::atomic::AtomicUsize::new(0);
 
     let walker = WalkBuilder::new(root)
         .hidden(!opts.include_hidden)
         .git_ignore(!opts.no_ignore)
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
-        .build();
+        .threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(12)))
+        .build_parallel();
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => {
-                skipped_error += 1;
-                continue;
-            }
-        };
-
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-
-        let path = entry.into_path();
-
-        if !opts.search_binary {
-            // Fast path: reject known binary extensions without I/O
-            if is_binary_extension(&path) {
-                skipped_binary += 1;
-                continue;
-            }
-
-            // Skip files larger than MAX_FILE_SIZE
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.len() > MAX_FILE_SIZE => {
-                    skipped_binary += 1;
-                    continue;
-                }
+    walker.run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(e) => e,
                 Err(_) => {
-                    skipped_error += 1;
-                    continue;
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
                 }
-                _ => {}
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
             }
 
-            // Content-based binary check: read only first 8KB
-            match is_binary_file(&path) {
-                Ok(true) => {
-                    skipped_binary += 1;
-                    continue;
-                }
-                Err(_) => {
-                    skipped_error += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
+            let path = entry.path();
 
-        files.push(path);
-    }
+            if !opts.search_binary {
+                if is_binary_extension(path) {
+                    skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
+                }
+
+                if let Ok(meta) = entry.metadata()
+                    && meta.len() > MAX_FILE_SIZE
+                {
+                    skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
+                }
+            }
+
+            files.lock().unwrap().push(entry.into_path());
+            ignore::WalkState::Continue
+        })
+    });
 
     WalkResult {
-        files,
-        skipped_binary,
-        skipped_error,
+        files: files.into_inner().unwrap(),
+        skipped_binary: skipped_binary.into_inner(),
+        skipped_error: skipped_error.into_inner(),
     }
 }

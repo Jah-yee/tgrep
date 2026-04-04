@@ -12,31 +12,42 @@ use tempfile::TempDir;
 fn setup_fixture() -> TempDir {
     let dir = TempDir::new().unwrap();
 
+    // Create a visible subdirectory for test files so the parallel walker
+    // (which respects hidden-directory filtering) always finds them, even
+    // when TempDir creates a dot-prefixed path like /tmp/.tmpXXXXXX.
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+
     fs::write(
-        dir.path().join("hello.rs"),
+        sub.join("hello.rs"),
         "fn main() {\n    println!(\"hello world\");\n}\n",
     )
     .unwrap();
 
     fs::write(
-        dir.path().join("lib.rs"),
+        sub.join("lib.rs"),
         "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
     )
     .unwrap();
 
     fs::write(
-        dir.path().join("config.toml"),
+        sub.join("config.toml"),
         "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
 
     fs::write(
-        dir.path().join("notes.txt"),
+        sub.join("notes.txt"),
         "This is a note.\nNothing important here.\nJust some text.\n",
     )
     .unwrap();
 
     dir
+}
+
+/// Returns the path to the test files inside the fixture.
+fn fixture_path(dir: &TempDir) -> String {
+    dir.path().join("testdata").to_str().unwrap().to_string()
 }
 
 fn tgrep() -> Command {
@@ -55,7 +66,7 @@ fn glob_single_pattern() {
             "-g",
             "*.rs",
             "fn",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -76,7 +87,7 @@ fn glob_multiple_patterns() {
             "-g",
             "*.toml",
             "fn|name",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -96,7 +107,7 @@ fn glob_no_matches() {
             "-g",
             "*.xyz",
             "fn",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .code(1); // no files match glob, so no matches
@@ -113,7 +124,7 @@ fn with_filename_accepted() {
             "--no-heading",
             "-H",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -129,7 +140,7 @@ fn with_filename_long_accepted() {
             "--no-heading",
             "--with-filename",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -147,7 +158,7 @@ fn no_filename_flat() {
             "--no-heading",
             "--no-filename",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -167,7 +178,7 @@ fn no_filename_count() {
             "--no-filename",
             "-c",
             "fn",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -195,7 +206,7 @@ fn line_number_short_accepted() {
             "--no-heading",
             "-n",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -211,7 +222,7 @@ fn line_number_long_accepted() {
             "--no-heading",
             "--line-number",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .success()
@@ -229,7 +240,7 @@ fn no_line_number_flat() {
             "--no-heading",
             "-N",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -255,7 +266,7 @@ fn no_line_number_long() {
             "--no-heading",
             "--no-line-number",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -277,7 +288,7 @@ fn no_filename_and_no_line_number() {
             "--no-filename",
             "-N",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -294,7 +305,7 @@ fn no_filename_and_no_line_number() {
 fn files_without_match_short() {
     let dir = setup_fixture();
     let output = tgrep()
-        .args(["--no-index", "-L", "fn", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-L", "fn", &fixture_path(&dir)])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -314,7 +325,7 @@ fn files_without_match_long() {
             "--no-index",
             "--files-without-match",
             "fn",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -330,7 +341,7 @@ fn files_without_match_all_match() {
     let dir = setup_fixture();
     // Every file contains a newline, so "." (any char) matches all files
     tgrep()
-        .args(["--no-index", "-L", ".", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-L", ".", &fixture_path(&dir)])
         .assert()
         .code(1) // no files without matches → exit 1
         .stdout(predicate::str::is_empty());
@@ -344,7 +355,7 @@ fn files_without_match_none_match() {
             "--no-index",
             "-L",
             "zzz_nonexistent_pattern_zzz",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -366,7 +377,7 @@ fn files_without_match_with_glob() {
             "-g",
             "*.rs",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -385,7 +396,7 @@ fn files_without_match_with_glob() {
 fn quiet_match_exits_zero() {
     let dir = setup_fixture();
     tgrep()
-        .args(["--no-index", "-q", "fn main", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-q", "fn main", &fixture_path(&dir)])
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
@@ -399,7 +410,7 @@ fn quiet_no_match_exits_one() {
             "--no-index",
             "-q",
             "zzz_nonexistent_zzz",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .assert()
         .code(1)
@@ -410,7 +421,7 @@ fn quiet_no_match_exits_one() {
 fn quiet_long_form() {
     let dir = setup_fixture();
     tgrep()
-        .args(["--no-index", "--quiet", "fn", dir.path().to_str().unwrap()])
+        .args(["--no-index", "--quiet", "fn", &fixture_path(&dir)])
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
@@ -420,7 +431,7 @@ fn quiet_long_form() {
 fn quiet_no_stderr_on_match() {
     let dir = setup_fixture();
     tgrep()
-        .args(["--no-index", "-q", "fn", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-q", "fn", &fixture_path(&dir)])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -434,13 +445,7 @@ fn quiet_with_files_without_match() {
     let dir = setup_fixture();
     // -q -L: exit 0 if any file doesn't match, no output
     tgrep()
-        .args([
-            "--no-index",
-            "-q",
-            "-L",
-            "fn main",
-            dir.path().to_str().unwrap(),
-        ])
+        .args(["--no-index", "-q", "-L", "fn main", &fixture_path(&dir)])
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
@@ -451,7 +456,7 @@ fn quiet_with_files_without_match_all_match() {
     let dir = setup_fixture();
     // Every file matches "." so -L finds nothing → exit 1
     tgrep()
-        .args(["--no-index", "-q", "-L", ".", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-q", "-L", ".", &fixture_path(&dir)])
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty());
@@ -469,7 +474,7 @@ fn no_filename_with_no_line_number_and_context() {
             "-A",
             "1",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -492,7 +497,7 @@ fn glob_multiple_with_files_only() {
             "-g",
             "*.toml",
             ".",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
@@ -508,7 +513,7 @@ fn files_without_match_exit_code_success() {
     let dir = setup_fixture();
     // "fn main" only matches hello.rs; lib.rs, config.toml, notes.txt don't
     tgrep()
-        .args(["--no-index", "-L", "fn main", dir.path().to_str().unwrap()])
+        .args(["--no-index", "-L", "fn main", &fixture_path(&dir)])
         .assert()
         .success(); // exit 0 because files without matches were found
 }
@@ -524,7 +529,7 @@ fn with_filename_and_no_filename_last_wins() {
             "-H",
             "--no-filename",
             "fn main",
-            dir.path().to_str().unwrap(),
+            &fixture_path(&dir),
         ])
         .output()
         .unwrap();
