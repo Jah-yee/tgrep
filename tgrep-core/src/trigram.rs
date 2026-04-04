@@ -3,6 +3,8 @@
 /// A trigram is every overlapping 3-byte window in a byte sequence.
 /// We pack 3 bytes into a `u32`: `(a << 16) | (b << 8) | c`.
 /// This gives us up to ~16.7M unique trigrams with zero collisions.
+use std::collections::HashMap;
+
 pub type TrigramHash = u32;
 
 /// Pack three bytes into a single u32 trigram hash.
@@ -61,50 +63,27 @@ pub fn extract(data: &[u8]) -> Vec<TrigramHash> {
 /// Extract all unique trigrams with positional and next-byte masks.
 ///
 /// For each unique trigram, computes:
-/// - `loc_mask`: Bloom filter of byte offsets where this trigram occurs
+/// - `loc_mask`: positional mask (offset % 8) for adjacency checks
 /// - `next_mask`: Bloom filter of bytes that immediately follow this trigram
 pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
     if data.len() < 3 {
         return Vec::new();
     }
 
-    // Two-pass: first pass accumulates masks, second collects results.
-    // Use a parallel array indexed by trigram hash (24-bit space).
-    let mut seen = vec![false; 1 << 24];
-    let mut loc_masks = vec![0u8; 1 << 24];
-    let mut next_masks = vec![0u8; 1 << 24];
-    let mut order = Vec::new();
+    // Use HashMap instead of 16M arrays — much less allocation pressure
+    // since typical files have far fewer than 16M unique trigrams.
+    let mut masks: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
 
     for (i, window) in data.windows(3).enumerate() {
         let h = hash(window[0], window[1], window[2]);
-        let idx = h as usize;
-
-        loc_masks[idx] |= loc_bit(i);
-
-        // Next byte is at position i+3 (the byte after the trigram)
+        let entry = masks.entry(h).or_default();
+        entry.loc_mask |= loc_bit(i);
         if i + 3 < data.len() {
-            next_masks[idx] |= next_bit(data[i + 3]);
-        }
-
-        if !seen[idx] {
-            seen[idx] = true;
-            order.push(h);
+            entry.next_mask |= next_bit(data[i + 3]);
         }
     }
 
-    order
-        .into_iter()
-        .map(|h| {
-            let idx = h as usize;
-            (
-                h,
-                TrigramMasks {
-                    loc_mask: loc_masks[idx],
-                    next_mask: next_masks[idx],
-                },
-            )
-        })
-        .collect()
+    masks.into_iter().collect()
 }
 
 /// Check whether consecutive trigrams from a literal can be adjacent based on masks.
