@@ -9,7 +9,7 @@ env:
 jobs:
   benchmark:
     name: Benchmark (${{ matrix.os }})
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]

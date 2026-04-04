@@ -9,7 +9,7 @@ env:
 jobs:
   benchmark:
     name: Benchmark (Windows)
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

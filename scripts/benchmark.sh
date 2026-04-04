@@ -177,11 +177,12 @@ if [ "$READY" = false ]; then
 fi
 
 # ── Benchmark: tgrep (client → serve) ──
+QUERY_TIMEOUT=120  # seconds per query
 echo ""
 echo "==> Benchmarking tgrep (client -> serve)..."
 TGREP_START=$(now_ns)
 for pattern in "${QUERIES[@]}"; do
-  "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1 || true
+  timeout "$QUERY_TIMEOUT" "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1 || true
 done
 TGREP_END=$(now_ns)
 TGREP_MS=$(( (TGREP_END - TGREP_START) / 1000000 ))
@@ -199,7 +200,7 @@ if command -v rg >/dev/null 2>&1; then
   echo "==> Benchmarking ripgrep..."
   RG_START=$(now_ns)
   for pattern in "${QUERIES[@]}"; do
-    rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
+    timeout "$QUERY_TIMEOUT" rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
   done
   RG_END=$(now_ns)
   RG_MS=$(( (RG_END - RG_START) / 1000000 ))
@@ -215,7 +216,7 @@ if command -v grep >/dev/null 2>&1; then
   echo "==> Benchmarking grep..."
   GREP_START=$(now_ns)
   for pattern in "${QUERIES[@]}"; do
-    grep -r -n -E --binary-files=without-match \
+    timeout "$QUERY_TIMEOUT" grep -r -n -E --binary-files=without-match \
       --exclude-dir=.git --exclude-dir=.tgrep \
       "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
   done

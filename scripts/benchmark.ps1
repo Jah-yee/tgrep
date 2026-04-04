@@ -162,6 +162,22 @@ if (-not $ready) {
     throw 'tgrep serve failed to start'
 }
 
+# Per-query timeout in seconds
+$QueryTimeout = 120
+
+# Helper: run a command with a timeout; returns $true if it completed in time.
+function Invoke-WithTimeout {
+    param([string]$Exe, [string[]]$Arguments, [int]$Seconds)
+    $p = Start-Process -FilePath $Exe -ArgumentList $Arguments `
+        -RedirectStandardOutput 'NUL' -RedirectStandardError 'NUL' `
+        -PassThru -WindowStyle Hidden
+    if (-not $p.WaitForExit($Seconds * 1000)) {
+        try { $p.Kill() } catch { }
+        return $false
+    }
+    return $true
+}
+
 # ── Benchmark: tgrep (client → serve) ──
 $savedEAP = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
@@ -169,7 +185,9 @@ try {
     Write-Host "`n==> Benchmarking tgrep (client -> serve)..." -ForegroundColor Cyan
     $tgrepSw = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($q in $Queries) {
-        & $TgrepBin $q $BenchRepoDir --index-path $IndexPath *>$null
+        Invoke-WithTimeout -Exe $TgrepBin `
+            -Arguments @($q, $BenchRepoDir, '--index-path', $IndexPath) `
+            -Seconds $QueryTimeout | Out-Null
     }
     $tgrepSw.Stop()
     $tgrepMs = $tgrepSw.ElapsedMilliseconds
@@ -192,7 +210,9 @@ if ($rgCmd) {
     $ErrorActionPreference = 'Continue'
     $rgSw = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($q in $Queries) {
-        & rg -n $q $BenchRepoDir *>$null
+        Invoke-WithTimeout -Exe 'rg' `
+            -Arguments @('-n', $q, $BenchRepoDir) `
+            -Seconds $QueryTimeout | Out-Null
     }
     $rgSw.Stop()
     $ErrorActionPreference = $savedEAP

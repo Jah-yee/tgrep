@@ -17,6 +17,21 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
+# Benchmark: 30-query search
+
+- **Repo**: [https://github.com/torvalds/linux](https://github.com/torvalds/linux)
+- **Files**: 93023
+- **Queries**: 30
+- **Date**: 2026-04-04T04:47:55Z
+- **Platform**: Windows AMD64
+- **Scope**: search only (index built before timing)
+- **tgrep mode**: client/server — `tgrep serve` runs in background, `tgrep` client connects via TCP
+
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 219316 | 7310.5 |
+| tgrep (client -> serve) | 149244 | 4974.8 |
+
 ## Architecture
 
 ```
