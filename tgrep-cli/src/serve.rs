@@ -788,7 +788,8 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
     std::fs::write(index_dir.join("index.bin"), b"")?;
     std::fs::write(index_dir.join("files.bin"), b"")?;
-    let meta = IndexMeta::new("", 0, 0);
+    let mut meta = IndexMeta::new("", 0, 0);
+    meta.complete = false; // empty skeleton — not a complete index
     meta.save(index_dir)?;
     Ok(())
 }
@@ -1000,12 +1001,18 @@ fn checkpoint_index_to_disk(
             return;
         }
 
-        // Brief write lock: drop mmap handles, move staged files in
+        // Brief write lock: drop mmap handles, move staged files, reopen reader
         {
             let mut index = state.index.write().unwrap();
             index.drop_reader();
             if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
                 eprintln!("[trace] warning: checkpoint move failed: {e}");
+            }
+            // Reopen the reader so future snapshots include checkpointed files.
+            // Without this, the reader stays empty and the final flush loses
+            // all files that were only in the on-disk reader (seeded files).
+            if let Err(e) = index.reopen_reader(&index_dir) {
+                eprintln!("[trace] warning: checkpoint reader reopen failed: {e}");
             }
         }
         let _ = std::fs::remove_dir_all(&staging_dir);
