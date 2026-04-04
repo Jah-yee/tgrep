@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::ondisk::PostingEntry;
 use crate::trigram;
 
 /// Bit flag to distinguish live index file IDs from reader file IDs.
@@ -28,6 +29,8 @@ impl RawIndexSnapshot {
 pub struct LiveIndex {
     /// Trigram → set of file IDs (with OVERLAY_BIT set).
     inverted: HashMap<u32, HashSet<u32>>,
+    /// Per-(trigram, file_id) masks for mask-aware filtering.
+    masks: HashMap<(u32, u32), trigram::TrigramMasks>,
     /// File ID → relative path.
     file_paths: HashMap<u32, String>,
     /// Path → file ID (for updates/deletes).
@@ -44,6 +47,7 @@ impl Default for LiveIndex {
     fn default() -> Self {
         Self {
             inverted: HashMap::new(),
+            masks: HashMap::new(),
             file_paths: HashMap::new(),
             path_to_id: HashMap::new(),
             deleted_paths: HashSet::new(),
@@ -68,11 +72,22 @@ impl LiveIndex {
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
 
-        let trigrams = trigram::extract(content);
+        // Extract trigrams with masks
+        let tri_masks = trigram::extract_with_masks(content);
         let lower = content.to_ascii_lowercase();
-        let lower_tris = trigram::extract(&lower);
-        for &tri in trigrams.iter().chain(lower_tris.iter()) {
+        let lower_tri_masks = trigram::extract_with_masks(&lower);
+
+        // Merge masks per trigram
+        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
+        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+
+        for (tri, m) in per_tri {
             self.inverted.entry(tri).or_default().insert(file_id);
+            self.masks.insert((tri, file_id), m);
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
@@ -83,6 +98,8 @@ impl LiveIndex {
 
     /// Insert or update a file with pre-computed trigrams.
     /// This avoids extracting trigrams while holding the write lock.
+    /// Note: masks are set to all-ones (no filtering) since pre-computed
+    /// trigrams don't include mask data.
     pub fn upsert_file_with_trigrams(&mut self, rel_path: &str, trigrams: Vec<u32>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
@@ -94,6 +111,13 @@ impl LiveIndex {
 
         for &tri in &trigrams {
             self.inverted.entry(tri).or_default().insert(file_id);
+            self.masks.insert(
+                (tri, file_id),
+                trigram::TrigramMasks {
+                    loc_mask: u8::MAX,
+                    next_mask: u8::MAX,
+                },
+            );
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
@@ -111,11 +135,35 @@ impl LiveIndex {
         self.dirty_count += 1;
     }
 
-    /// Look up a trigram in the live overlay.
+    /// Look up a trigram in the live overlay (file IDs only).
     pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
         self.inverted
             .get(&trigram)
             .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Look up a trigram with masks in the live overlay.
+    pub fn lookup_trigram_with_masks(&self, trigram: u32) -> Vec<PostingEntry> {
+        self.inverted
+            .get(&trigram)
+            .map(|set| {
+                set.iter()
+                    .map(|&fid| {
+                        let m = self.masks.get(&(trigram, fid)).copied().unwrap_or(
+                            trigram::TrigramMasks {
+                                loc_mask: u8::MAX,
+                                next_mask: u8::MAX,
+                            },
+                        );
+                        PostingEntry {
+                            file_id: fid,
+                            loc_mask: m.loc_mask,
+                            next_mask: m.next_mask,
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -205,19 +253,15 @@ impl LiveIndex {
 
     /// Snapshot the inverted index data for disk serialization.
     /// Returns (ordered_paths, remapped_inverted_index) with sequential file IDs.
-    /// This is designed to be called under a brief read lock, then written to disk
-    /// without holding the lock.
     pub fn snapshot_for_disk(&self) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
         Self::remap_snapshot(&self.inverted, &self.file_paths)
     }
 
     /// Remap raw data into disk-ready format (sequential IDs, sorted postings).
-    /// Can be called without holding any lock on the LiveIndex.
     pub(crate) fn remap_snapshot(
         inverted: &HashMap<u32, HashSet<u32>>,
         file_paths: &HashMap<u32, String>,
     ) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
-        // Sort file paths by raw ID for deterministic ordering
         let mut pairs: Vec<_> = file_paths.iter().collect();
         pairs.sort_by_key(|&(&id, _)| id & !OVERLAY_BIT);
         let paths: Vec<&str> = pairs.iter().map(|(_, p)| p.as_str()).collect();
@@ -248,11 +292,20 @@ impl LiveIndex {
     }
 
     fn remove_file_by_id(&mut self, file_id: u32) {
-        // Remove from inverted index
-        self.inverted.retain(|_, set| {
+        // Remove from inverted index and masks
+        let mut trigrams_to_clean = Vec::new();
+        self.inverted.retain(|&tri, set| {
             set.remove(&file_id);
-            !set.is_empty()
+            if set.is_empty() {
+                trigrams_to_clean.push(tri);
+                false
+            } else {
+                true
+            }
         });
+        // Clean up mask entries for this file
+        self.masks.retain(|&(_, fid), _| fid != file_id);
+
         if let Some(path) = self.file_paths.remove(&file_id) {
             self.path_to_id.remove(&path);
         }

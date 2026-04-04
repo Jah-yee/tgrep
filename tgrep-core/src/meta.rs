@@ -31,7 +31,7 @@ impl IndexMeta {
             .unwrap_or_default()
             .as_secs();
         Self {
-            version: 1,
+            version: 2,
             num_files,
             num_trigrams,
             created_at: now,

@@ -90,41 +90,117 @@ $FileCount = (git -C $BenchRepoDir ls-files | Measure-Object -Line).Lines
 
 # ── Build index ──
 Write-Host '==> Building tgrep index...' -ForegroundColor Cyan
+$indexSw = [System.Diagnostics.Stopwatch]::StartNew()
 & $TgrepBin index $BenchRepoDir --index-path $IndexPath
 if ($LASTEXITCODE -ne 0) { throw 'tgrep index failed' }
+$indexSw.Stop()
+$indexMs = $indexSw.ElapsedMilliseconds
+Write-Host "Index built in ${indexMs}ms" -ForegroundColor Green
 
-# ── 30 search patterns (mix of literals, multi-word, and regex) ──
+# ── 102 search patterns (mix of literals, multi-word, and regex) ──
 $Queries = @(
     'mutex_lock'
+    'spin_lock_irqsave'
     'printk'
     'EXPORT_SYMBOL'
+    'MODULE_LICENSE'
     'kfree'
     'kmalloc'
     'BUG_ON'
+    'WARN_ON'
     'pr_err'
+    'pr_info'
+    'pr_warn'
+    'dev_err'
+    'dev_info'
+    'netdev_err'
+    'DEFINE_MUTEX'
+    'LIST_HEAD'
+    'atomic_read'
+    'atomic_set'
+    'rcu_read_lock'
+    'rcu_read_unlock'
+    'smp_wmb'
     'unlikely'
+    'likely'
     'IS_ERR'
+    'PTR_ERR'
+    'ERR_PTR'
     'container_of'
     'ARRAY_SIZE'
+    'BUILD_BUG_ON'
+    'static_assert'
     '__init'
+    '__exit'
     'module_init'
+    'module_exit'
     'platform_driver'
+    'pci_driver'
+    'usb_driver'
+    'i2c_driver'
+    'spi_driver'
+    'of_match_table'
+    'compatible'
     'struct device'
     'struct file'
+    'struct inode'
+    'struct mutex'
+    'struct spinlock'
+    'struct list_head'
+    'struct kobject'
+    'struct platform_device'
+    'struct pci_dev'
+    'struct net_device'
     'struct sk_buff'
+    'struct socket'
     'struct task_struct'
+    'struct mm_struct'
     'struct page'
+    'struct bio'
+    'struct request'
+    'struct dentry'
+    'struct super_block'
     'alloc_chrdev_region'
+    'cdev_init'
+    'class_create'
+    'device_create'
+    'sysfs_create_group'
+    'debugfs_create_dir'
     'proc_create'
+    'register_netdev'
+    'register_chrdev'
     'ioctl'
+    'mmap'
+    'poll'
     'read'
+    'write'
+    'open'
+    'release'
+    'probe'
+    'remove'
+    'suspend'
+    'resume'
     'TODO'
     'FIXME'
-    'SPDX-License-Identifier'
+    'HACK'
+    'XXX'
+    'deprecated'
     '^#include <linux/'
+    '^#include <asm/'
+    '^#include <net/'
     '^#define\s+[A-Z_]+'
+    '^\s*return -[A-Z]+;'
+    'enum\s+\{'
+    'union\s+\{'
+    'typedef\s+struct'
+    'goto\s+\w+;'
     'for_each_\w+'
+    '__attribute__\s*\(\('
     '#ifdef\s+CONFIG_'
+    '#if\s+defined'
+    'MODULE_AUTHOR'
+    'MODULE_DESCRIPTION'
+    'SPDX-License-Identifier'
 )
 
 $QueryCount = $Queries.Count
@@ -208,6 +284,22 @@ $dateStr  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $repoName = Split-Path $BenchRepoDir -Leaf
 $arch     = $env:PROCESSOR_ARCHITECTURE
 
+# Calculate index size
+$indexSizeBytes = 0
+foreach ($f in @('index.bin', 'lookup.bin', 'files.bin', 'meta.json')) {
+    $fp = Join-Path $IndexPath $f
+    if (Test-Path $fp) {
+        $indexSizeBytes += (Get-Item $fp).Length
+    }
+}
+if ($indexSizeBytes -ge 1048576) {
+    $indexSize = '{0:F1} MB' -f ($indexSizeBytes / 1048576)
+} elseif ($indexSizeBytes -ge 1024) {
+    $indexSize = '{0:F1} KB' -f ($indexSizeBytes / 1024)
+} else {
+    $indexSize = "$indexSizeBytes B"
+}
+
 $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("# Benchmark: ${QueryCount}-query search on repo: $repoName")
 [void]$sb.AppendLine()
@@ -216,6 +308,8 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("- **Queries**: $QueryCount")
 [void]$sb.AppendLine("- **Date**: $dateStr")
 [void]$sb.AppendLine("- **Platform**: Windows $arch")
+[void]$sb.AppendLine("- **Index build time**: ${indexMs}ms")
+[void]$sb.AppendLine("- **Index size**: $indexSize")
 [void]$sb.AppendLine('- **Scope**: search only (index built before timing)')
 [void]$sb.AppendLine('- **tgrep mode**: client/server — `tgrep serve` runs in background, `tgrep` client connects via TCP')
 [void]$sb.AppendLine()

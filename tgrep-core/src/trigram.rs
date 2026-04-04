@@ -3,12 +3,44 @@
 /// A trigram is every overlapping 3-byte window in a byte sequence.
 /// We pack 3 bytes into a `u32`: `(a << 16) | (b << 8) | c`.
 /// This gives us up to ~16.7M unique trigrams with zero collisions.
+use std::collections::HashMap;
+
 pub type TrigramHash = u32;
 
 /// Pack three bytes into a single u32 trigram hash.
 #[inline]
 pub fn hash(a: u8, b: u8, c: u8) -> TrigramHash {
     (a as u32) << 16 | (b as u32) << 8 | c as u32
+}
+
+/// Hash a byte offset into a bit position in an 8-bit loc_mask.
+/// Uses `offset % 8` so consecutive offsets map to adjacent bits,
+/// enabling rotate-and-AND adjacency checks.
+#[inline]
+fn loc_bit(offset: usize) -> u8 {
+    1u8 << (offset % 8)
+}
+
+/// Map a byte to one of 8 Bloom bits for next_mask.
+/// Uses a multiplicative hash to spread ASCII characters evenly.
+#[inline]
+fn next_bit(byte: u8) -> u8 {
+    1u8 << (byte.wrapping_mul(0x9E) >> 5 & 0x07)
+}
+
+/// Compute the Bloom filter bit for a byte (public, for query-time checks).
+#[inline]
+pub fn bloom_hash(byte: u8) -> u8 {
+    next_bit(byte)
+}
+
+/// Per-trigram masks for a single file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrigramMasks {
+    /// Positional mask: bit i is set if the trigram occurs at offset where offset % 8 == i.
+    pub loc_mask: u8,
+    /// 8-bit Bloom filter of bytes that immediately follow this trigram in the file.
+    pub next_mask: u8,
 }
 
 /// Extract all unique trigrams from a byte slice.
@@ -26,6 +58,58 @@ pub fn extract(data: &[u8]) -> Vec<TrigramHash> {
         }
     }
     result
+}
+
+/// Extract all unique trigrams with positional and next-byte masks.
+///
+/// For each unique trigram, computes:
+/// - `loc_mask`: positional mask (offset % 8) for adjacency checks
+/// - `next_mask`: Bloom filter of bytes that immediately follow this trigram
+pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
+    if data.len() < 3 {
+        return Vec::new();
+    }
+
+    // Use HashMap instead of 16M arrays — much less allocation pressure
+    // since typical files have far fewer than 16M unique trigrams.
+    let mut masks: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
+
+    for (i, window) in data.windows(3).enumerate() {
+        let h = hash(window[0], window[1], window[2]);
+        let entry = masks.entry(h).or_default();
+        entry.loc_mask |= loc_bit(i);
+        if i + 3 < data.len() {
+            entry.next_mask |= next_bit(data[i + 3]);
+        }
+    }
+
+    masks.into_iter().collect()
+}
+
+/// Check whether consecutive trigrams from a literal can be adjacent based on masks.
+///
+/// For trigrams at offsets i and i+1 in a literal, rotating the first
+/// trigram's loc_mask left by 1 bit and AND'ing with the second's loc_mask
+/// should be non-zero if they appear adjacently in the file.
+pub fn check_adjacency(masks: &[(TrigramHash, TrigramMasks)]) -> bool {
+    if masks.len() <= 1 {
+        return true;
+    }
+    for pair in masks.windows(2) {
+        let prev_loc = pair[0].1.loc_mask;
+        let next_loc = pair[1].1.loc_mask;
+        // Rotate prev_loc left by 1 bit within 8-bit space
+        let rotated = prev_loc.rotate_left(1);
+        if rotated & next_loc == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check whether a trigram's next_mask is compatible with an expected next byte.
+pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
+    masks.next_mask & next_bit(next_byte) != 0
 }
 
 /// Extract trigrams from a string pattern (for query planning).
@@ -76,5 +160,51 @@ mod tests {
     fn test_is_binary() {
         assert!(!is_binary(b"hello world"));
         assert!(is_binary(b"hello\0world"));
+    }
+
+    #[test]
+    fn test_extract_with_masks_basic() {
+        let results = extract_with_masks(b"abcde");
+        // Trigrams: "abc", "bcd", "cde" → 3 unique
+        assert_eq!(results.len(), 3);
+        let abc = results
+            .iter()
+            .find(|(h, _)| *h == hash(b'a', b'b', b'c'))
+            .unwrap();
+        // "abc" is followed by 'd'
+        assert!(check_next_byte(&abc.1, b'd'));
+    }
+
+    #[test]
+    fn test_extract_with_masks_short() {
+        assert!(extract_with_masks(b"ab").is_empty());
+        assert!(extract_with_masks(b"").is_empty());
+    }
+
+    #[test]
+    fn test_next_mask_filters_false_positive() {
+        // File contains "abcXe" — trigram "abc" is followed by 'X', not 'd'
+        let results = extract_with_masks(b"abcXe");
+        let abc = results
+            .iter()
+            .find(|(h, _)| *h == hash(b'a', b'b', b'c'))
+            .unwrap();
+        // 'X' should be in the mask
+        assert!(check_next_byte(&abc.1, b'X'));
+        // 'd' should NOT be in the mask (different bloom_hash bit)
+        // bloom_hash('X'=88): 88*0x9E=0x3530, >>5=0x1A9, &7=1 → bit 1
+        // bloom_hash('d'=100): 100*0x9E=0x3E18, >>5=0x1F0, &7=0 → bit 0
+        assert!(!check_next_byte(&abc.1, b'd'));
+    }
+
+    #[test]
+    fn test_loc_mask_nonzero() {
+        let results = extract_with_masks(b"hello world");
+        for (_, masks) in &results {
+            assert_ne!(
+                masks.loc_mask, 0,
+                "loc_mask should have at least one bit set"
+            );
+        }
     }
 }

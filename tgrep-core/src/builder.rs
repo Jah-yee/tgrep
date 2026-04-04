@@ -6,8 +6,8 @@ use std::path::Path;
 
 use crate::Result;
 use crate::meta::IndexMeta;
-use crate::ondisk::{self, LookupEntry};
-use crate::trigram;
+use crate::ondisk::{self, LookupEntry, PostingEntry};
+use crate::trigram::{self, TrigramMasks};
 use crate::walker;
 
 const INDEX_DIR_NAME: &str = ".tgrep";
@@ -36,9 +36,9 @@ pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) 
         walk.skipped_error
     );
 
-    // Read all files and extract trigrams in parallel
+    // Read all files and extract trigrams with masks in parallel
     eprintln!("Extracting trigrams...");
-    let file_data: Vec<(String, Vec<u32>)> = walk
+    let file_data: Vec<(String, Vec<(u32, TrigramMasks)>)> = walk
         .files
         .par_iter()
         .filter_map(|path| {
@@ -48,86 +48,45 @@ pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) 
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            // Extract trigrams from both original and lowercased content
-            // so case-insensitive queries can use the index effectively.
-            let mut trigrams = trigram::extract(&data);
+            // Extract trigrams with masks from both original and lowercased content
+            let mut tri_masks = trigram::extract_with_masks(&data);
             let lower = data.to_ascii_lowercase();
             if lower != data {
-                let lower_tris = trigram::extract(&lower);
-                trigrams.extend(lower_tris);
+                let lower_tris = trigram::extract_with_masks(&lower);
+                tri_masks.extend(lower_tris);
             }
-            Some((rel, trigrams))
+            Some((rel, tri_masks))
         })
         .collect();
 
-    // Assign file IDs and build inverted index
+    // Assign file IDs and build inverted index with masks
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(file_data.len());
-    let mut inverted: HashMap<u32, Vec<u32>> = HashMap::new();
+    // trigram → Vec<(file_id, loc_mask, next_mask)>
+    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
 
-    for (id, (path, trigrams)) in file_data.iter().enumerate() {
+    for (id, (path, tri_masks)) in file_data.iter().enumerate() {
         let file_id = id as u32;
         file_id_map.push((file_id, path.clone()));
-        for &tri in trigrams {
-            inverted.entry(tri).or_default().push(file_id);
+
+        // Merge masks per trigram for this file (a trigram may appear from
+        // both original and lowercase extraction)
+        let mut per_tri: HashMap<u32, TrigramMasks> = HashMap::new();
+        for &(tri, masks) in tri_masks {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= masks.loc_mask;
+            entry.next_mask |= masks.next_mask;
+        }
+
+        for (tri, masks) in per_tri {
+            inverted.entry(tri).or_default().push(PostingEntry {
+                file_id,
+                loc_mask: masks.loc_mask,
+                next_mask: masks.next_mask,
+            });
         }
     }
 
-    // Sort trigrams for binary-searchable lookup table
-    let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
-    sorted_trigrams.sort_unstable();
-
-    // Write index.bin and lookup.bin
-    eprintln!(
-        "Writing index ({} trigrams, {} files)...",
-        sorted_trigrams.len(),
-        file_id_map.len()
-    );
-
-    let mut postings_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
-    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
-    let mut offset: u64 = 0;
-
-    for &tri in &sorted_trigrams {
-        let posting_list = inverted.get(&tri).unwrap();
-        let length = posting_list.len() as u32;
-
-        lookup_entries.push(LookupEntry {
-            trigram: tri,
-            offset,
-            length,
-        });
-
-        for &fid in posting_list {
-            postings_file.write_all(&fid.to_le_bytes())?;
-        }
-        offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
-    }
-    postings_file.flush()?;
-
-    // Write lookup.bin
-    let mut lookup_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("lookup.bin"))?);
-    for entry in &lookup_entries {
-        lookup_file.write_all(&entry.encode())?;
-    }
-    lookup_file.flush()?;
-
-    // Write files.bin
-    let mut files_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
-    for (id, path) in &file_id_map {
-        files_file.write_all(&ondisk::encode_file_entry(*id, path))?;
-    }
-    files_file.flush()?;
-
-    // Write meta.json
-    let meta = IndexMeta::new(
-        &root.to_string_lossy(),
-        file_id_map.len() as u64,
-        sorted_trigrams.len() as u64,
-    );
-    meta.save(&index_dir)?;
+    write_index_v2(&index_dir, &root, &file_id_map, &inverted)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
     Ok(())
@@ -140,6 +99,9 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
 
 /// Write the on-disk index from a pre-computed snapshot (paths + inverted index).
 /// This allows the caller to snapshot under a brief lock, then write without holding it.
+///
+/// Note: snapshots from the server still use the legacy format (no masks).
+/// This writes v1-compatible posting entries (file_id only) unless masks are available.
 pub fn write_index_from_snapshot(
     root: &Path,
     index_dir: &Path,
@@ -152,7 +114,8 @@ pub fn write_index_from_snapshot(
     let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
     sorted_trigrams.sort_unstable();
 
-    // Write index.bin
+    // Write index.bin — v2 posting entries with zero masks (still benefits from
+    // the v2 reader, and a subsequent `tgrep index` will compute real masks).
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
     let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
@@ -169,7 +132,12 @@ pub fn write_index_from_snapshot(
         });
 
         for &fid in posting_list {
-            postings_file.write_all(&fid.to_le_bytes())?;
+            let entry = PostingEntry {
+                file_id: fid,
+                loc_mask: u8::MAX, // all bits set = no filtering
+                next_mask: u8::MAX,
+            };
+            postings_file.write_all(&entry.encode())?;
         }
         offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
     }
@@ -191,7 +159,7 @@ pub fn write_index_from_snapshot(
     }
     files_file.flush()?;
 
-    // Write meta.json
+    // Write meta.json (version 2 for mask-aware format)
     let root = std::fs::canonicalize(root)?;
     let mut meta = IndexMeta::new(
         &root.to_string_lossy(),
@@ -199,6 +167,68 @@ pub fn write_index_from_snapshot(
         sorted_trigrams.len() as u64,
     );
     meta.complete = complete;
+    meta.save(index_dir)?;
+
+    Ok(())
+}
+
+/// Internal: write v2 index with masks.
+fn write_index_v2(
+    index_dir: &Path,
+    root: &Path,
+    file_id_map: &[(u32, String)],
+    inverted: &HashMap<u32, Vec<PostingEntry>>,
+) -> Result<()> {
+    let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
+    sorted_trigrams.sort_unstable();
+
+    eprintln!(
+        "Writing index ({} trigrams, {} files)...",
+        sorted_trigrams.len(),
+        file_id_map.len()
+    );
+
+    let mut postings_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
+    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut offset: u64 = 0;
+
+    for &tri in &sorted_trigrams {
+        let posting_list = inverted.get(&tri).unwrap();
+        let length = posting_list.len() as u32;
+
+        lookup_entries.push(LookupEntry {
+            trigram: tri,
+            offset,
+            length,
+        });
+
+        for entry in posting_list {
+            postings_file.write_all(&entry.encode())?;
+        }
+        offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
+    }
+    postings_file.flush()?;
+
+    let mut lookup_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("lookup.bin"))?);
+    for entry in &lookup_entries {
+        lookup_file.write_all(&entry.encode())?;
+    }
+    lookup_file.flush()?;
+
+    let mut files_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
+    for (id, path) in file_id_map {
+        files_file.write_all(&ondisk::encode_file_entry(*id, path))?;
+    }
+    files_file.flush()?;
+
+    let meta = IndexMeta::new(
+        &root.to_string_lossy(),
+        file_id_map.len() as u64,
+        sorted_trigrams.len() as u64,
+    );
     meta.save(index_dir)?;
 
     Ok(())

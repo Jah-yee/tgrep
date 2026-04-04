@@ -361,7 +361,14 @@ fn handle_search(
     let t_index = Instant::now();
     let candidate_info: Vec<(String, PathBuf)> = {
         let index = state.index.read().unwrap();
-        let candidates = index.execute_query(&plan);
+
+        // Use mask-aware filtering for literal patterns (fixed_string or simple literals)
+        let effective_pattern = if case_insensitive {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+        let candidates = index.execute_query_with_masks(&plan, &effective_pattern);
 
         candidates
             .iter()

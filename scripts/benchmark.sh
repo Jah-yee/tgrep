@@ -104,40 +104,116 @@ FILE_COUNT=$(git -C "$BENCH_REPO_DIR" ls-files | wc -l | tr -d ' ')
 
 # ── Build index ──
 echo "==> Building tgrep index..."
+INDEX_START=$(now_ns)
 "$TGREP_BIN" index "$BENCH_REPO_DIR" --index-path "$INDEX_PATH"
+INDEX_END=$(now_ns)
+INDEX_MS=$(( (INDEX_END - INDEX_START) / 1000000 ))
+echo "Index built in ${INDEX_MS}ms"
 
-# ── 30 search patterns (mix of literals, multi-word, and regex) ──
+# ── 102 search patterns (mix of literals, multi-word, and regex) ──
 QUERIES=(
   'mutex_lock'
+  'spin_lock_irqsave'
   'printk'
   'EXPORT_SYMBOL'
+  'MODULE_LICENSE'
   'kfree'
   'kmalloc'
   'BUG_ON'
+  'WARN_ON'
   'pr_err'
+  'pr_info'
+  'pr_warn'
+  'dev_err'
+  'dev_info'
+  'netdev_err'
+  'DEFINE_MUTEX'
+  'LIST_HEAD'
+  'atomic_read'
+  'atomic_set'
+  'rcu_read_lock'
+  'rcu_read_unlock'
+  'smp_wmb'
   'unlikely'
+  'likely'
   'IS_ERR'
+  'PTR_ERR'
+  'ERR_PTR'
   'container_of'
   'ARRAY_SIZE'
+  'BUILD_BUG_ON'
+  'static_assert'
   '__init'
+  '__exit'
   'module_init'
+  'module_exit'
   'platform_driver'
+  'pci_driver'
+  'usb_driver'
+  'i2c_driver'
+  'spi_driver'
+  'of_match_table'
+  'compatible'
   'struct device'
   'struct file'
+  'struct inode'
+  'struct mutex'
+  'struct spinlock'
+  'struct list_head'
+  'struct kobject'
+  'struct platform_device'
+  'struct pci_dev'
+  'struct net_device'
   'struct sk_buff'
+  'struct socket'
   'struct task_struct'
+  'struct mm_struct'
   'struct page'
+  'struct bio'
+  'struct request'
+  'struct dentry'
+  'struct super_block'
   'alloc_chrdev_region'
+  'cdev_init'
+  'class_create'
+  'device_create'
+  'sysfs_create_group'
+  'debugfs_create_dir'
   'proc_create'
+  'register_netdev'
+  'register_chrdev'
   'ioctl'
+  'mmap'
+  'poll'
   'read'
+  'write'
+  'open'
+  'release'
+  'probe'
+  'remove'
+  'suspend'
+  'resume'
   'TODO'
   'FIXME'
-  'SPDX-License-Identifier'
+  'HACK'
+  'XXX'
+  'deprecated'
   '^#include <linux/'
+  '^#include <asm/'
+  '^#include <net/'
   '^#define\s+[A-Z_]+'
+  '^\s*return -[A-Z]+;'
+  'enum\s+\{'
+  'union\s+\{'
+  'typedef\s+struct'
+  'goto\s+\w+;'
   'for_each_\w+'
+  '__attribute__\s*\(\('
   '#ifdef\s+CONFIG_'
+  '#if\s+defined'
+  'MODULE_AUTHOR'
+  'MODULE_DESCRIPTION'
+  'SPDX-License-Identifier'
 )
 
 QUERY_COUNT=${#QUERIES[@]}
@@ -231,6 +307,21 @@ TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 REPO_NAME=$(basename "$BENCH_REPO_DIR")
 PLATFORM="$(uname -s) $(uname -m)"
 
+# Calculate index size
+INDEX_SIZE_BYTES=0
+for f in "$INDEX_PATH"/index.bin "$INDEX_PATH"/lookup.bin "$INDEX_PATH"/files.bin "$INDEX_PATH"/meta.json; do
+  if [ -f "$f" ]; then
+    INDEX_SIZE_BYTES=$(( INDEX_SIZE_BYTES + $(wc -c < "$f" | tr -d ' ') ))
+  fi
+done
+if [ "$INDEX_SIZE_BYTES" -ge 1048576 ]; then
+  INDEX_SIZE=$(awk "BEGIN { printf \"%.1f MB\", $INDEX_SIZE_BYTES / 1048576 }")
+elif [ "$INDEX_SIZE_BYTES" -ge 1024 ]; then
+  INDEX_SIZE=$(awk "BEGIN { printf \"%.1f KB\", $INDEX_SIZE_BYTES / 1024 }")
+else
+  INDEX_SIZE="${INDEX_SIZE_BYTES} B"
+fi
+
 RESULTS_DIR="$(dirname "$RESULTS_PATH")"
 if [ -n "$RESULTS_DIR" ] && [ "$RESULTS_DIR" != "." ]; then
   mkdir -p "$RESULTS_DIR"
@@ -244,6 +335,8 @@ cat > "$RESULTS_PATH" <<EOF
 - **Queries**: $QUERY_COUNT
 - **Date**: $TIMESTAMP
 - **Platform**: $PLATFORM
+- **Index build time**: ${INDEX_MS}ms
+- **Index size**: $INDEX_SIZE
 - **Scope**: search only (index built before timing)
 - **tgrep mode**: client/server — \`tgrep serve\` runs in background, \`tgrep\` client connects via TCP
 

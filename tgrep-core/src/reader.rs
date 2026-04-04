@@ -8,7 +8,7 @@ use std::fs::File;
 use std::path::Path;
 
 use crate::Result;
-use crate::ondisk::{self, LOOKUP_ENTRY_SIZE, LookupEntry, POSTING_ENTRY_SIZE};
+use crate::ondisk::{self, LOOKUP_ENTRY_SIZE, LookupEntry, POSTING_ENTRY_SIZE, PostingEntry};
 
 pub struct IndexReader {
     lookup: Option<Mmap>,
@@ -73,8 +73,17 @@ impl IndexReader {
     }
 
     /// Binary search the lookup table for a trigram hash.
-    /// Returns the posting list (file IDs) or an empty vec if not found.
+    /// Returns the posting list (file IDs only) or an empty vec if not found.
     pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
+        self.lookup_trigram_with_masks(trigram)
+            .into_iter()
+            .map(|e| e.file_id)
+            .collect()
+    }
+
+    /// Binary search the lookup table for a trigram hash.
+    /// Returns full posting entries with masks.
+    pub fn lookup_trigram_with_masks(&self, trigram: u32) -> Vec<PostingEntry> {
         if self.lookup.is_none() {
             return Vec::new();
         }
@@ -82,7 +91,7 @@ impl IndexReader {
         match idx {
             Some(i) => {
                 let entry = self.read_lookup_entry(i);
-                self.read_posting_list(entry.offset, entry.length)
+                self.read_posting_entries(entry.offset, entry.length)
             }
             None => Vec::new(),
         }
@@ -119,8 +128,9 @@ impl IndexReader {
         let mut result = Vec::with_capacity(self.num_entries);
         for i in 0..self.num_entries {
             let entry = self.read_lookup_entry(i);
-            let postings = self.read_posting_list(entry.offset, entry.length);
-            result.push((entry.trigram, postings));
+            let postings = self.read_posting_entries(entry.offset, entry.length);
+            let file_ids: Vec<u32> = postings.into_iter().map(|e| e.file_id).collect();
+            result.push((entry.trigram, file_ids));
         }
         result
     }
@@ -148,7 +158,7 @@ impl IndexReader {
         LookupEntry::decode(buf)
     }
 
-    fn read_posting_list(&self, offset: u64, length: u32) -> Vec<u32> {
+    fn read_posting_entries(&self, offset: u64, length: u32) -> Vec<PostingEntry> {
         let postings = match self.postings.as_ref() {
             Some(p) => p,
             None => return Vec::new(),
@@ -158,9 +168,9 @@ impl IndexReader {
         for i in 0..length as usize {
             let pos = start + i * POSTING_ENTRY_SIZE;
             if pos + POSTING_ENTRY_SIZE <= postings.len() {
-                let fid =
-                    u32::from_le_bytes(postings[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap());
-                result.push(fid);
+                let buf: &[u8; POSTING_ENTRY_SIZE] =
+                    postings[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap();
+                result.push(PostingEntry::decode(buf));
             }
         }
         result
