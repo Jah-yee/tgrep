@@ -11,28 +11,34 @@ pub fn hash(a: u8, b: u8, c: u8) -> TrigramHash {
     (a as u32) << 16 | (b as u32) << 8 | c as u32
 }
 
-/// Hash a byte offset into a bit position in a 64-bit loc_mask.
+/// Hash a byte offset into a bit position in an 8-bit loc_mask.
+/// Uses `offset % 8` so consecutive offsets map to adjacent bits,
+/// enabling rotate-and-AND adjacency checks.
 #[inline]
-fn loc_bit(offset: usize) -> u64 {
-    // Map byte offset to one of 64 buckets. We use a multiplicative hash
-    // so nearby offsets don't always map to adjacent bits.
-    let bucket = ((offset as u64).wrapping_mul(0x9E3779B97F4A7C15)) >> 58; // top 6 bits → 0..63
-    1u64 << bucket
+fn loc_bit(offset: usize) -> u8 {
+    1u8 << (offset % 8)
 }
 
-/// Hash a byte into a bit position in a 32-bit next_mask (Bloom filter).
+/// Map a byte to one of 8 Bloom bits for next_mask.
+/// Uses a multiplicative hash to spread ASCII characters evenly.
 #[inline]
-fn next_bit(byte: u8) -> u32 {
-    1u32 << (byte & 31)
+fn next_bit(byte: u8) -> u8 {
+    1u8 << (byte.wrapping_mul(0x9E) >> 5 & 0x07)
+}
+
+/// Compute the Bloom filter bit for a byte (public, for query-time checks).
+#[inline]
+pub fn bloom_hash(byte: u8) -> u8 {
+    next_bit(byte)
 }
 
 /// Per-trigram masks for a single file.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrigramMasks {
-    /// Positional Bloom filter: which "slots" in the file contain this trigram.
-    pub loc_mask: u64,
-    /// Bloom filter of bytes that immediately follow this trigram in the file.
-    pub next_mask: u32,
+    /// Positional mask: bit i is set if the trigram occurs at offset where offset % 8 == i.
+    pub loc_mask: u8,
+    /// 8-bit Bloom filter of bytes that immediately follow this trigram in the file.
+    pub next_mask: u8,
 }
 
 /// Extract all unique trigrams from a byte slice.
@@ -65,8 +71,8 @@ pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
     // Two-pass: first pass accumulates masks, second collects results.
     // Use a parallel array indexed by trigram hash (24-bit space).
     let mut seen = vec![false; 1 << 24];
-    let mut loc_masks = vec![0u64; 1 << 24];
-    let mut next_masks = vec![0u32; 1 << 24];
+    let mut loc_masks = vec![0u8; 1 << 24];
+    let mut next_masks = vec![0u8; 1 << 24];
     let mut order = Vec::new();
 
     for (i, window) in data.windows(3).enumerate() {
@@ -103,9 +109,9 @@ pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
 
 /// Check whether consecutive trigrams from a literal can be adjacent based on masks.
 ///
-/// For trigrams at offsets i and i+1 in a literal, the loc_mask of the first
-/// trigram shifted by 1 position AND'd with the second should be non-zero
-/// if they appear adjacently in the file.
+/// For trigrams at offsets i and i+1 in a literal, rotating the first
+/// trigram's loc_mask left by 1 bit and AND'ing with the second's loc_mask
+/// should be non-zero if they appear adjacently in the file.
 pub fn check_adjacency(masks: &[(TrigramHash, TrigramMasks)]) -> bool {
     if masks.len() <= 1 {
         return true;
@@ -113,14 +119,9 @@ pub fn check_adjacency(masks: &[(TrigramHash, TrigramMasks)]) -> bool {
     for pair in masks.windows(2) {
         let prev_loc = pair[0].1.loc_mask;
         let next_loc = pair[1].1.loc_mask;
-        // Rotate prev_loc by 1 bit position. Since loc_bit uses a multiplicative
-        // hash, adjacent offsets map to different bits — but when we stored them
-        // in the file, offset i and offset i+1 each got their own loc_bit.
-        // For the adjacency check, we check all 64 possible rotations: if any
-        // single-bit rotation of prev_loc overlaps with next_loc, adjacency is possible.
-        // Simplified: just AND the raw masks. If they share any bit, the trigrams
-        // appear in overlapping positional buckets (probabilistic but effective).
-        if prev_loc & next_loc == 0 {
+        // Rotate prev_loc left by 1 bit within 8-bit space
+        let rotated = prev_loc.rotate_left(1);
+        if rotated & next_loc == 0 {
             return false;
         }
     }
@@ -211,10 +212,9 @@ mod tests {
             .unwrap();
         // 'X' should be in the mask
         assert!(check_next_byte(&abc.1, b'X'));
-        // 'd' may or may not be (Bloom filter can have false positives, but
-        // for a single-entry Bloom it should only have the actual byte)
-        // Since next_bit uses byte & 31, 'd'=100 and 'X'=88 → different bits
-        // 'd' & 31 = 4, 'X' & 31 = 24
+        // 'd' should NOT be in the mask (different bloom_hash bit)
+        // bloom_hash('X'=88): 88*0x9E=0x3530, >>5=0x1A9, &7=1 → bit 1
+        // bloom_hash('d'=100): 100*0x9E=0x3E18, >>5=0x1F0, &7=0 → bit 0
         assert!(!check_next_byte(&abc.1, b'd'));
     }
 

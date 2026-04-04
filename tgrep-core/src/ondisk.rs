@@ -12,12 +12,12 @@
 /// ```
 ///
 /// ## `index.bin` — concatenated posting lists
-/// Each entry is 16 bytes: `file_id(u32) + loc_mask(u64) + next_mask(u32)`.
+/// Each entry is 6 bytes: `file_id(u32) + loc_mask(u8) + next_mask(u8)`.
 ///
 /// ## `files.bin` — file ID → path mapping
 /// Variable-length records: `file_id(u32 LE) + path_len(u16 LE) + path_bytes`.
 pub(crate) const LOOKUP_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
-pub(crate) const POSTING_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
+pub(crate) const POSTING_ENTRY_SIZE: usize = 6; // 4 + 1 + 1
 
 /// A single entry in `lookup.bin`.
 #[derive(Debug, Clone, Copy)]
@@ -28,27 +28,30 @@ pub(crate) struct LookupEntry {
 }
 
 /// A single posting entry in `index.bin` (v2 format with masks).
+/// 6 bytes on disk: file_id(4) + loc_mask(1) + next_mask(1).
 #[derive(Debug, Clone, Copy)]
 pub struct PostingEntry {
     pub file_id: u32,
-    pub loc_mask: u64,
-    pub next_mask: u32,
+    /// Bit i is set if the trigram occurs at some byte offset where offset % 8 == i.
+    pub loc_mask: u8,
+    /// 8-bit Bloom filter of characters immediately following this trigram.
+    pub next_mask: u8,
 }
 
 impl PostingEntry {
     pub fn encode(&self) -> [u8; POSTING_ENTRY_SIZE] {
         let mut buf = [0u8; POSTING_ENTRY_SIZE];
         buf[0..4].copy_from_slice(&self.file_id.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.loc_mask.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.next_mask.to_le_bytes());
+        buf[4] = self.loc_mask;
+        buf[5] = self.next_mask;
         buf
     }
 
     pub fn decode(buf: &[u8; POSTING_ENTRY_SIZE]) -> Self {
         Self {
             file_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            loc_mask: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
-            next_mask: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            loc_mask: buf[4],
+            next_mask: buf[5],
         }
     }
 }
@@ -134,8 +137,8 @@ mod tests {
     fn test_posting_entry_roundtrip() {
         let entry = PostingEntry {
             file_id: 42,
-            loc_mask: 0xDEAD_BEEF_CAFE_BABE,
-            next_mask: 0x1234_5678,
+            loc_mask: 0b10101010,
+            next_mask: 0b11001100,
         };
         let encoded = entry.encode();
         let decoded = PostingEntry::decode(&encoded);

@@ -134,8 +134,8 @@ pub fn write_index_from_snapshot(
         for &fid in posting_list {
             let entry = PostingEntry {
                 file_id: fid,
-                loc_mask: u64::MAX, // all bits set = no filtering
-                next_mask: u32::MAX,
+                loc_mask: u8::MAX, // all bits set = no filtering
+                next_mask: u8::MAX,
             };
             postings_file.write_all(&entry.encode())?;
         }

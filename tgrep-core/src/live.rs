@@ -114,8 +114,8 @@ impl LiveIndex {
             self.masks.insert(
                 (tri, file_id),
                 trigram::TrigramMasks {
-                    loc_mask: u64::MAX,
-                    next_mask: u32::MAX,
+                    loc_mask: u8::MAX,
+                    next_mask: u8::MAX,
                 },
             );
         }
@@ -152,8 +152,8 @@ impl LiveIndex {
                     .map(|&fid| {
                         let m = self.masks.get(&(trigram, fid)).copied().unwrap_or(
                             trigram::TrigramMasks {
-                                loc_mask: u64::MAX,
-                                next_mask: u32::MAX,
+                                loc_mask: u8::MAX,
+                                next_mask: u8::MAX,
                             },
                         );
                         PostingEntry {

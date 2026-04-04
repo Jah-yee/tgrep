@@ -223,7 +223,7 @@ where
 
             // Start with smallest posting list
             let (first_tri, first_list) = lists.remove(0);
-            let mut candidates: Vec<(u32, u64, u32)> = first_list
+            let mut candidates: Vec<(u32, u8, u8)> = first_list
                 .into_iter()
                 .map(|e| (e.file_id, e.loc_mask, e.next_mask))
                 .collect();
@@ -232,7 +232,8 @@ where
 
             // Apply next_mask check for the first trigram
             if let Some(next_byte) = next_byte_after_trigram(first_tri, pattern_bytes) {
-                candidates.retain(|&(_, _, nm)| nm & (1u32 << (next_byte & 31)) != 0);
+                let bit = trigram::bloom_hash(next_byte);
+                candidates.retain(|&(_, _, nm)| nm & bit != 0);
             }
 
             // Intersect with remaining posting lists
@@ -251,7 +252,7 @@ where
                             let nm = list[j].next_mask;
                             // Apply next_mask check for this trigram
                             let pass = match next_byte_after_trigram(tri, pattern_bytes) {
-                                Some(nb) => nm & (1u32 << (nb & 31)) != 0,
+                                Some(nb) => nm & trigram::bloom_hash(nb) != 0,
                                 None => true,
                             };
                             if pass {
