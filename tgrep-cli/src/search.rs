@@ -359,9 +359,9 @@ fn search_local_index(
         if matched {
             if !opts.files_without_match {
                 had_matches = true;
-            }
-            if opts.quiet {
-                break;
+                if opts.quiet {
+                    break;
+                }
             }
         } else if opts.files_without_match {
             if !opts.quiet {
@@ -445,9 +445,9 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
         if matched {
             if !opts.files_without_match {
                 had_matches = true;
-            }
-            if opts.quiet {
-                break;
+                if opts.quiet {
+                    break;
+                }
             }
         } else if opts.files_without_match {
             if !opts.quiet {

@@ -31,6 +31,14 @@ impl HybridIndex {
         self.reader.close();
     }
 
+    /// Reopen the on-disk reader from updated index files, keeping the live
+    /// overlay intact. Use after `drop_reader` + file replacement so that
+    /// subsequent snapshots still include the on-disk data.
+    pub fn reopen_reader(&mut self, index_dir: &Path) -> Result<()> {
+        self.reader = IndexReader::open(index_dir)?;
+        Ok(())
+    }
+
     /// Look up candidate file IDs for a trigram, merging reader + overlay.
     pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
         let mut reader_ids = self.reader.lookup_trigram(trigram);
