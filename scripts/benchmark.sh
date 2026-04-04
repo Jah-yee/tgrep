@@ -71,23 +71,6 @@ now_ns() {
   fi
 }
 
-# Portable per-query timeout wrapper.
-# GNU timeout is available on Linux; on macOS we use perl as a fallback.
-run_with_timeout() {
-  local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@" || true
-  else
-    perl -e '
-      alarm shift @ARGV;
-      $SIG{ALRM} = sub { kill 9, $pid; exit 0 };
-      $pid = fork // die;
-      if ($pid == 0) { exec @ARGV; die "exec: $!" }
-      waitpid $pid, 0;
-    ' "$secs" "$@" || true
-  fi
-}
-
 # ── Build ──
 if [ "$SKIP_BUILD" = false ]; then
   echo "==> Building tgrep (release)..."
@@ -194,12 +177,11 @@ if [ "$READY" = false ]; then
 fi
 
 # ── Benchmark: tgrep (client → serve) ──
-QUERY_TIMEOUT=60  # seconds per query
 echo ""
 echo "==> Benchmarking tgrep (client -> serve)..."
 TGREP_START=$(now_ns)
 for pattern in "${QUERIES[@]}"; do
-  run_with_timeout "$QUERY_TIMEOUT" "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1
+  "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1 || true
 done
 TGREP_END=$(now_ns)
 TGREP_MS=$(( (TGREP_END - TGREP_START) / 1000000 ))
@@ -217,7 +199,7 @@ if command -v rg >/dev/null 2>&1; then
   echo "==> Benchmarking ripgrep..."
   RG_START=$(now_ns)
   for pattern in "${QUERIES[@]}"; do
-    run_with_timeout "$QUERY_TIMEOUT" rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1
+    rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
   done
   RG_END=$(now_ns)
   RG_MS=$(( (RG_END - RG_START) / 1000000 ))
