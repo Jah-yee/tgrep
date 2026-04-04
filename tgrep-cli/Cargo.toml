@@ -23,3 +23,9 @@ clap = { version = "4", features = ["derive"] }
 notify = "7"
 rayon = "1"
 regex = "1"
+lru = "0.16.3"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+predicates = "3"

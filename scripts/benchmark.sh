@@ -178,14 +178,31 @@ fi
 
 # ── Benchmark: tgrep (client → serve) ──
 echo ""
+log_mem() {
+  if [ -f /proc/meminfo ]; then
+    awk '/MemTotal|MemAvailable|MemFree|SwapTotal|SwapFree/ {printf "  %s %s\n", $1, $2" "$3}' /proc/meminfo
+  elif command -v vm_stat >/dev/null 2>&1; then
+    vm_stat | head -10
+  fi
+}
+
+echo "==> Memory before tgrep benchmark:"
+log_mem
+
 echo "==> Benchmarking tgrep (client -> serve)..."
 TGREP_START=$(now_ns)
+QIDX=0
 for pattern in "${QUERIES[@]}"; do
+  QIDX=$((QIDX + 1))
+  echo "  [$QIDX/$QUERY_COUNT] $pattern"
   "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1 || true
 done
 TGREP_END=$(now_ns)
 TGREP_MS=$(( (TGREP_END - TGREP_START) / 1000000 ))
 echo "tgrep: ${TGREP_MS}ms total"
+
+echo "==> Memory after tgrep benchmark:"
+log_mem
 
 # ── Stop serve ──
 echo "==> Stopping tgrep serve..."
@@ -206,24 +223,6 @@ if command -v rg >/dev/null 2>&1; then
   echo "ripgrep: ${RG_MS}ms total"
 else
   echo "ripgrep (rg) not found in PATH, skipping"
-fi
-
-# ── Benchmark: grep ──
-GREP_MS=-1
-if command -v grep >/dev/null 2>&1; then
-  echo ""
-  echo "==> Benchmarking grep..."
-  GREP_START=$(now_ns)
-  for pattern in "${QUERIES[@]}"; do
-    grep -r -n -E --binary-files=without-match \
-      --exclude-dir=.git --exclude-dir=.tgrep \
-      "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
-  done
-  GREP_END=$(now_ns)
-  GREP_MS=$(( (GREP_END - GREP_START) / 1000000 ))
-  echo "grep: ${GREP_MS}ms total"
-else
-  echo "grep not found in PATH, skipping"
 fi
 
 # ── Write results ──
@@ -252,10 +251,6 @@ cat > "$RESULTS_PATH" <<EOF
 | --- | ---: | ---: |
 EOF
 
-if [ "$GREP_MS" -ge 0 ]; then
-  GREP_AVG=$(awk "BEGIN { printf \"%.1f\", $GREP_MS / $QUERY_COUNT }")
-  echo "| grep | $GREP_MS | $GREP_AVG |" >> "$RESULTS_PATH"
-fi
 if [ "$RG_MS" -ge 0 ]; then
   RG_AVG=$(awk "BEGIN { printf \"%.1f\", $RG_MS / $QUERY_COUNT }")
   echo "| ripgrep | $RG_MS | $RG_AVG |" >> "$RESULTS_PATH"
