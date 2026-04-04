@@ -12,12 +12,12 @@
 /// ```
 ///
 /// ## `index.bin` — concatenated posting lists
-/// Each entry is a u32 file_id (4 bytes LE).
+/// Each entry is 16 bytes: `file_id(u32) + loc_mask(u64) + next_mask(u32)`.
 ///
 /// ## `files.bin` — file ID → path mapping
 /// Variable-length records: `file_id(u32 LE) + path_len(u16 LE) + path_bytes`.
 pub(crate) const LOOKUP_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
-pub(crate) const POSTING_ENTRY_SIZE: usize = 4;
+pub(crate) const POSTING_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
 
 /// A single entry in `lookup.bin`.
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +25,32 @@ pub(crate) struct LookupEntry {
     pub trigram: u32,
     pub offset: u64,
     pub length: u32,
+}
+
+/// A single posting entry in `index.bin` (v2 format with masks).
+#[derive(Debug, Clone, Copy)]
+pub struct PostingEntry {
+    pub file_id: u32,
+    pub loc_mask: u64,
+    pub next_mask: u32,
+}
+
+impl PostingEntry {
+    pub fn encode(&self) -> [u8; POSTING_ENTRY_SIZE] {
+        let mut buf = [0u8; POSTING_ENTRY_SIZE];
+        buf[0..4].copy_from_slice(&self.file_id.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.loc_mask.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.next_mask.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(buf: &[u8; POSTING_ENTRY_SIZE]) -> Self {
+        Self {
+            file_id: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            loc_mask: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+            next_mask: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        }
+    }
 }
 
 impl LookupEntry {
@@ -102,5 +128,19 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], (7, "src/main.rs".to_string()));
         assert_eq!(entries[1], (12, "README.md".to_string()));
+    }
+
+    #[test]
+    fn test_posting_entry_roundtrip() {
+        let entry = PostingEntry {
+            file_id: 42,
+            loc_mask: 0xDEAD_BEEF_CAFE_BABE,
+            next_mask: 0x1234_5678,
+        };
+        let encoded = entry.encode();
+        let decoded = PostingEntry::decode(&encoded);
+        assert_eq!(decoded.file_id, entry.file_id);
+        assert_eq!(decoded.loc_mask, entry.loc_mask);
+        assert_eq!(decoded.next_mask, entry.next_mask);
     }
 }

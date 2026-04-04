@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Result;
 use crate::live::{self, LiveIndex};
+use crate::ondisk::PostingEntry;
 use crate::query::{self, QueryPlan};
 use crate::reader::IndexReader;
 
@@ -48,6 +49,23 @@ impl HybridIndex {
         reader_ids
     }
 
+    /// Look up candidate posting entries with masks, merging reader + overlay.
+    pub fn lookup_trigram_with_masks(&self, trigram: u32) -> Vec<PostingEntry> {
+        let mut reader_entries = self.reader.lookup_trigram_with_masks(trigram);
+        let live_entries = self.live.lookup_trigram_with_masks(trigram);
+
+        reader_entries.retain(|e| {
+            if let Some(path) = self.reader.file_path(e.file_id) {
+                !self.live.is_deleted(path) && !self.live_has_path(path)
+            } else {
+                false
+            }
+        });
+
+        reader_entries.extend(live_entries);
+        reader_entries
+    }
+
     /// Resolve a file ID to a path (works for both reader and overlay IDs).
     pub fn file_path(&self, file_id: u32) -> Option<&str> {
         if live::LiveIndex::is_overlay_id(file_id) {
@@ -81,6 +99,14 @@ impl HybridIndex {
             return self.all_file_ids();
         }
         query::execute_plan(plan, &|tri| self.lookup_trigram(tri))
+    }
+
+    /// Execute a query plan with mask-aware filtering.
+    pub fn execute_query_with_masks(&self, plan: &QueryPlan, pattern: &str) -> Vec<u32> {
+        if plan.is_match_all() {
+            return self.all_file_ids();
+        }
+        query::execute_plan_with_masks(plan, pattern, &|tri| self.lookup_trigram_with_masks(tri))
     }
 
     /// Total number of files across both layers.

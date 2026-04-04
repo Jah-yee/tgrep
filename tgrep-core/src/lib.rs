@@ -11,3 +11,4 @@ pub mod trigram;
 pub mod walker;
 
 pub use error::{Error, Result};
+pub use ondisk::PostingEntry;

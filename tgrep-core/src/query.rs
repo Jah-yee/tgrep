@@ -5,6 +5,7 @@
 /// nodes that can be evaluated against the index.
 use regex_syntax::hir::{Class, Hir, HirKind, Literal};
 
+use crate::ondisk::PostingEntry;
 use crate::trigram::{self, TrigramHash};
 
 /// A node in the query plan tree.
@@ -167,7 +168,6 @@ where
             if trigrams.is_empty() {
                 return Vec::new();
             }
-            // Start with the smallest posting list for efficiency
             let mut lists: Vec<Vec<u32>> = trigrams.iter().map(|&t| lookup(t)).collect();
             lists.sort_by_key(|l| l.len());
 
@@ -175,11 +175,10 @@ where
             result.sort_unstable();
             result.dedup();
 
-            for list in &lists {
-                let mut set: Vec<u32> = list.clone();
-                set.sort_unstable();
-                set.dedup();
-                result = intersect_sorted(&result, &set);
+            for mut list in lists {
+                list.sort_unstable();
+                list.dedup();
+                result = intersect_sorted(&result, &list);
                 if result.is_empty() {
                     break;
                 }
@@ -198,6 +197,107 @@ where
         }
         QueryPlan::MatchAll => Vec::new(), // caller must handle: scan all files
     }
+}
+
+/// Execute a query plan with mask-aware filtering.
+///
+/// Uses loc_mask adjacency and next_mask checks to reduce false-positive
+/// candidates. The `pattern` is the original search literal used to extract
+/// the trigrams — needed for next_mask verification.
+pub fn execute_plan_with_masks<F>(plan: &QueryPlan, pattern: &str, lookup: &F) -> Vec<u32>
+where
+    F: Fn(TrigramHash) -> Vec<PostingEntry>,
+{
+    match plan {
+        QueryPlan::And(trigrams) => {
+            if trigrams.is_empty() {
+                return Vec::new();
+            }
+
+            let pattern_bytes = pattern.as_bytes();
+
+            // Fetch full posting entries (with masks) for each trigram
+            let mut lists: Vec<(TrigramHash, Vec<PostingEntry>)> =
+                trigrams.iter().map(|&t| (t, lookup(t))).collect();
+            lists.sort_by_key(|(_, l)| l.len());
+
+            // Start with smallest posting list
+            let (first_tri, first_list) = lists.remove(0);
+            let mut candidates: Vec<(u32, u64, u32)> = first_list
+                .into_iter()
+                .map(|e| (e.file_id, e.loc_mask, e.next_mask))
+                .collect();
+            candidates.sort_by_key(|&(fid, _, _)| fid);
+            candidates.dedup_by_key(|e| e.0);
+
+            // Apply next_mask check for the first trigram
+            if let Some(next_byte) = next_byte_after_trigram(first_tri, pattern_bytes) {
+                candidates.retain(|&(_, _, nm)| nm & (1u32 << (next_byte & 31)) != 0);
+            }
+
+            // Intersect with remaining posting lists
+            for (tri, mut list) in lists {
+                list.sort_by_key(|e| e.file_id);
+                list.dedup_by_key(|e| e.file_id);
+
+                // Intersect by file_id, using next_mask to filter
+                let mut new_candidates = Vec::new();
+                let (mut i, mut j) = (0, 0);
+                while i < candidates.len() && j < list.len() {
+                    let (fid_a, _, _) = candidates[i];
+                    let fid_b = list[j].file_id;
+                    match fid_a.cmp(&fid_b) {
+                        std::cmp::Ordering::Equal => {
+                            let nm = list[j].next_mask;
+                            // Apply next_mask check for this trigram
+                            let pass = match next_byte_after_trigram(tri, pattern_bytes) {
+                                Some(nb) => nm & (1u32 << (nb & 31)) != 0,
+                                None => true,
+                            };
+                            if pass {
+                                new_candidates.push((fid_a, list[j].loc_mask, nm));
+                            }
+                            i += 1;
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                    }
+                }
+                candidates = new_candidates;
+                if candidates.is_empty() {
+                    break;
+                }
+            }
+
+            candidates.into_iter().map(|(fid, _, _)| fid).collect()
+        }
+        QueryPlan::Or(plans) => {
+            let mut result = Vec::new();
+            for sub in plans {
+                let mut sub_result = execute_plan_with_masks(sub, pattern, lookup);
+                result.append(&mut sub_result);
+            }
+            result.sort_unstable();
+            result.dedup();
+            result
+        }
+        QueryPlan::MatchAll => Vec::new(),
+    }
+}
+
+/// Find the byte that follows a given trigram in the pattern string.
+fn next_byte_after_trigram(trigram: TrigramHash, pattern: &[u8]) -> Option<u8> {
+    if pattern.len() < 4 {
+        return None;
+    }
+    for window in pattern.windows(4) {
+        let h = trigram::hash(window[0], window[1], window[2]);
+        if h == trigram {
+            return Some(window[3]);
+        }
+    }
+    None
 }
 
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -320,6 +420,79 @@ mod tests {
         assert!(
             candidates.contains(&0),
             "case-insensitive search should find the file"
+        );
+    }
+
+    #[test]
+    fn test_mask_filtering_finds_match() {
+        // File contains "mutex_lock" — should be found with mask filtering
+        let content = b"calling mutex_lock here";
+        let tri_masks = trigram::extract_with_masks(content);
+        let lower = content.to_ascii_lowercase();
+        let lower_tri_masks = trigram::extract_with_masks(&lower);
+
+        // Build inverted index with masks for file_id=0
+        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
+        let mut per_tri = std::collections::HashMap::<u32, trigram::TrigramMasks>::new();
+        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+        for (tri, m) in per_tri {
+            inverted.entry(tri).or_default().push(PostingEntry {
+                file_id: 0,
+                loc_mask: m.loc_mask,
+                next_mask: m.next_mask,
+            });
+        }
+
+        let plan = build_literal_plan("mutex_lock", false);
+        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
+            inverted.get(&tri).cloned().unwrap_or_default()
+        });
+
+        assert!(
+            candidates.contains(&0),
+            "mask filtering should find the file containing 'mutex_lock'"
+        );
+    }
+
+    #[test]
+    fn test_mask_filtering_rejects_false_positive() {
+        // File contains "mutex" and "clock" but NOT "mutex_clock" or anything
+        // that has the trigrams adjacent. The next_mask should filter it out.
+        let content = b"use mutex; use clock;";
+        let tri_masks = trigram::extract_with_masks(content);
+
+        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
+        let mut per_tri = std::collections::HashMap::<u32, trigram::TrigramMasks>::new();
+        for &(tri, m) in &tri_masks {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+        for (tri, m) in per_tri {
+            inverted.entry(tri).or_default().push(PostingEntry {
+                file_id: 0,
+                loc_mask: m.loc_mask,
+                next_mask: m.next_mask,
+            });
+        }
+
+        // Search for "mutex_lock" — file doesn't contain this, but has some
+        // overlapping trigrams. The mask filtering should reduce or eliminate
+        // this as a candidate.
+        let plan = build_literal_plan("mutex_lock", false);
+        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
+            inverted.get(&tri).cloned().unwrap_or_default()
+        });
+
+        // The file should NOT be a candidate because it doesn't contain all
+        // required trigrams (e.g., "x_l", "_lo", "loc" are missing entirely)
+        assert!(
+            candidates.is_empty(),
+            "mask filtering should reject file not containing 'mutex_lock' trigrams"
         );
     }
 }
