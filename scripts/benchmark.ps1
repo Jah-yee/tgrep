@@ -90,8 +90,12 @@ $FileCount = (git -C $BenchRepoDir ls-files | Measure-Object -Line).Lines
 
 # ── Build index ──
 Write-Host '==> Building tgrep index...' -ForegroundColor Cyan
+$indexSw = [System.Diagnostics.Stopwatch]::StartNew()
 & $TgrepBin index $BenchRepoDir --index-path $IndexPath
 if ($LASTEXITCODE -ne 0) { throw 'tgrep index failed' }
+$indexSw.Stop()
+$indexMs = $indexSw.ElapsedMilliseconds
+Write-Host "Index built in ${indexMs}ms" -ForegroundColor Green
 
 # ── 102 search patterns (mix of literals, multi-word, and regex) ──
 $Queries = @(
@@ -280,6 +284,22 @@ $dateStr  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 $repoName = Split-Path $BenchRepoDir -Leaf
 $arch     = $env:PROCESSOR_ARCHITECTURE
 
+# Calculate index size
+$indexSizeBytes = 0
+foreach ($f in @('index.bin', 'lookup.bin', 'files.bin', 'meta.json')) {
+    $fp = Join-Path $IndexPath $f
+    if (Test-Path $fp) {
+        $indexSizeBytes += (Get-Item $fp).Length
+    }
+}
+if ($indexSizeBytes -ge 1048576) {
+    $indexSize = '{0:F1} MB' -f ($indexSizeBytes / 1048576)
+} elseif ($indexSizeBytes -ge 1024) {
+    $indexSize = '{0:F1} KB' -f ($indexSizeBytes / 1024)
+} else {
+    $indexSize = "$indexSizeBytes B"
+}
+
 $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("# Benchmark: ${QueryCount}-query search on repo: $repoName")
 [void]$sb.AppendLine()
@@ -288,6 +308,8 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine("- **Queries**: $QueryCount")
 [void]$sb.AppendLine("- **Date**: $dateStr")
 [void]$sb.AppendLine("- **Platform**: Windows $arch")
+[void]$sb.AppendLine("- **Index build time**: ${indexMs}ms")
+[void]$sb.AppendLine("- **Index size**: $indexSize")
 [void]$sb.AppendLine('- **Scope**: search only (index built before timing)')
 [void]$sb.AppendLine('- **tgrep mode**: client/server — `tgrep serve` runs in background, `tgrep` client connects via TCP')
 [void]$sb.AppendLine()

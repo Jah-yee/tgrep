@@ -104,7 +104,11 @@ FILE_COUNT=$(git -C "$BENCH_REPO_DIR" ls-files | wc -l | tr -d ' ')
 
 # ── Build index ──
 echo "==> Building tgrep index..."
+INDEX_START=$(now_ns)
 "$TGREP_BIN" index "$BENCH_REPO_DIR" --index-path "$INDEX_PATH"
+INDEX_END=$(now_ns)
+INDEX_MS=$(( (INDEX_END - INDEX_START) / 1000000 ))
+echo "Index built in ${INDEX_MS}ms"
 
 # ── 102 search patterns (mix of literals, multi-word, and regex) ──
 QUERIES=(
@@ -303,6 +307,21 @@ TIMESTAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 REPO_NAME=$(basename "$BENCH_REPO_DIR")
 PLATFORM="$(uname -s) $(uname -m)"
 
+# Calculate index size
+INDEX_SIZE_BYTES=0
+for f in "$INDEX_PATH"/index.bin "$INDEX_PATH"/lookup.bin "$INDEX_PATH"/files.bin "$INDEX_PATH"/meta.json; do
+  if [ -f "$f" ]; then
+    INDEX_SIZE_BYTES=$(( INDEX_SIZE_BYTES + $(wc -c < "$f" | tr -d ' ') ))
+  fi
+done
+if [ "$INDEX_SIZE_BYTES" -ge 1048576 ]; then
+  INDEX_SIZE=$(awk "BEGIN { printf \"%.1f MB\", $INDEX_SIZE_BYTES / 1048576 }")
+elif [ "$INDEX_SIZE_BYTES" -ge 1024 ]; then
+  INDEX_SIZE=$(awk "BEGIN { printf \"%.1f KB\", $INDEX_SIZE_BYTES / 1024 }")
+else
+  INDEX_SIZE="${INDEX_SIZE_BYTES} B"
+fi
+
 RESULTS_DIR="$(dirname "$RESULTS_PATH")"
 if [ -n "$RESULTS_DIR" ] && [ "$RESULTS_DIR" != "." ]; then
   mkdir -p "$RESULTS_DIR"
@@ -316,6 +335,8 @@ cat > "$RESULTS_PATH" <<EOF
 - **Queries**: $QUERY_COUNT
 - **Date**: $TIMESTAMP
 - **Platform**: $PLATFORM
+- **Index build time**: ${INDEX_MS}ms
+- **Index size**: $INDEX_SIZE
 - **Scope**: search only (index built before timing)
 - **tgrep mode**: client/server — \`tgrep serve\` runs in background, \`tgrep\` client connects via TCP
 
