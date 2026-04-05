@@ -12,19 +12,14 @@ jobs:
     timeout-minutes: 180
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # ubuntu-latest excluded: 7 GB RAM is insufficient for indexing 440k+ files
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Build release
         run: cargo build --release
-
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          df -h
 
       - name: Run benchmark
         run: |
