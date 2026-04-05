@@ -915,6 +915,10 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         start.elapsed().as_secs_f64() * 1000.0
     );
 
+    // Persist the updated index immediately so changes survive a crash
+    eprintln!("[trace] stale check: flushing updated index to disk...");
+    flush_index_to_disk(state, root, index_dir);
+
     // Re-stamp ALL walked files (including content-binary ones) so the
     // next startup won't treat unchanged non-indexed files as "new".
     let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
