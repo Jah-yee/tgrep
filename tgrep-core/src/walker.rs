@@ -98,3 +98,69 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         skipped_error: skipped_error.into_inner(),
     }
 }
+
+/// Filesystem metadata for a single file (no content read).
+pub struct FileMeta {
+    pub relative_path: String,
+    pub mtime: u64,
+    pub size: u64,
+}
+
+/// Walk a directory tree collecting only filesystem metadata (mtime, size).
+/// No file content is read — this is used for stale file detection on startup.
+pub fn walk_file_metadata(root: &Path) -> Vec<FileMeta> {
+    let results = std::sync::Mutex::new(Vec::new());
+
+    let walker = WalkBuilder::new(root)
+        .hidden(true) // skip hidden by default
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(12)))
+        .build_parallel();
+
+    walker.run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+
+            let path = entry.path();
+
+            if is_binary_extension(path) {
+                return ignore::WalkState::Continue;
+            }
+
+            let rel_path = match path.strip_prefix(root) {
+                Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                Err(_) => return ignore::WalkState::Continue,
+            };
+
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() > MAX_FILE_SIZE {
+                    return ignore::WalkState::Continue;
+                }
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                results.lock().unwrap().push(FileMeta {
+                    relative_path: rel_path,
+                    mtime,
+                    size: meta.len(),
+                });
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
+
+    results.into_inner().unwrap()
+}

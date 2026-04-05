@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
 use crate::Result;
 
 const META_FILENAME: &str = "meta.json";
+const FILESTAMPS_FILENAME: &str = "filestamps.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
@@ -57,4 +59,54 @@ impl IndexMeta {
         let meta: Self = serde_json::from_str(&data)?;
         Ok(meta)
     }
+}
+
+/// Per-file stamp for change detection (mtime + size).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileStamp {
+    pub mtime: u64,
+    pub size: u64,
+}
+
+/// Write per-file stamps to `filestamps.json` in the index directory.
+pub fn write_filestamps(stamps: &HashMap<String, FileStamp>, index_dir: &Path) -> Result<()> {
+    let path = index_dir.join(FILESTAMPS_FILENAME);
+    let json = serde_json::to_string(stamps)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+/// Read per-file stamps from `filestamps.json` in the index directory.
+pub fn read_filestamps(index_dir: &Path) -> Result<HashMap<String, FileStamp>> {
+    let path = index_dir.join(FILESTAMPS_FILENAME);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let stamps: HashMap<String, FileStamp> = serde_json::from_str(&json)?;
+    Ok(stamps)
+}
+
+/// Collect file stamps (mtime + size) for a list of relative paths under `root`.
+pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, FileStamp> {
+    let mut stamps = HashMap::with_capacity(paths.len());
+    for rel_path in paths {
+        let full_path = root.join(rel_path);
+        if let Ok(metadata) = std::fs::metadata(&full_path) {
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            stamps.insert(
+                rel_path.clone(),
+                FileStamp {
+                    mtime,
+                    size: metadata.len(),
+                },
+            );
+        }
+    }
+    stamps
 }

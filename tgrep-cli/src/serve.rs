@@ -151,6 +151,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, no_watch: bool) -> Result<()>
         thread::spawn(move || {
             background_index_build(&build_state, &build_root, &build_index_dir);
         });
+    } else {
+        // Index is complete — check for files that changed while server was offline
+        let stale_state = Arc::clone(&state);
+        let stale_root = root.clone();
+        let stale_index_dir = index_dir.clone();
+        thread::spawn(move || {
+            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir);
+        });
     }
 
     // Start file watcher (unless --no-watch)
@@ -794,6 +802,142 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Detect files that changed while the server was not running.
+/// Compares stored filestamps against current filesystem metadata, then upserts
+/// changed/new files and removes deleted files from the LiveIndex.
+fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
+    use tgrep_core::meta::{self, FileStamp};
+    use tgrep_core::walker;
+
+    let start = Instant::now();
+    eprintln!("[trace] stale check: comparing index against filesystem...");
+
+    // Load stored per-file stamps from last index write
+    let old_stamps = match meta::read_filestamps(index_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[trace] stale check: no filestamps found ({e}), skipping");
+            return;
+        }
+    };
+    if old_stamps.is_empty() {
+        eprintln!("[trace] stale check: no filestamps found, skipping");
+        return;
+    }
+
+    // Walk filesystem metadata (no content reads)
+    let current_meta = walker::walk_file_metadata(root);
+    let walk_ms = start.elapsed().as_millis();
+
+    // Build lookup of current filesystem state
+    let mut current_set: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(current_meta.len());
+    let mut changed: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+
+    for fm in &current_meta {
+        current_set.insert(fm.relative_path.clone());
+        let stamp = FileStamp {
+            mtime: fm.mtime,
+            size: fm.size,
+        };
+        match old_stamps.get(&fm.relative_path) {
+            Some(old) if *old == stamp => {
+                // Unchanged — skip
+            }
+            Some(_) => {
+                // mtime or size differs — file changed
+                changed.push(fm.relative_path.clone());
+            }
+            None => {
+                // New file (not in previous index)
+                added.push(fm.relative_path.clone());
+            }
+        }
+    }
+
+    // Detect deleted files (in old stamps but not on filesystem)
+    let deleted: Vec<String> = old_stamps
+        .keys()
+        .filter(|p| !current_set.contains(p.as_str()))
+        .cloned()
+        .collect();
+
+    let total_changes = changed.len() + added.len() + deleted.len();
+    if total_changes == 0 {
+        eprintln!(
+            "[trace] stale check: index is up-to-date ({} files checked in {}ms)",
+            current_meta.len(),
+            walk_ms
+        );
+        return;
+    }
+
+    eprintln!(
+        "[trace] stale check: {} changed, {} new, {} deleted (walk: {}ms)",
+        changed.len(),
+        added.len(),
+        deleted.len(),
+        walk_ms
+    );
+
+    // Apply changes to the LiveIndex
+    let update_start = Instant::now();
+    let files_to_update: Vec<String> = changed.into_iter().chain(added).collect();
+
+    {
+        let mut index = state.index.write().unwrap();
+
+        // Remove deleted files
+        for rel_path in &deleted {
+            index.live.delete_file(rel_path);
+        }
+
+        // Upsert changed/new files (reads content, extracts trigrams)
+        for rel_path in &files_to_update {
+            index.live.update_from_disk(root, rel_path);
+        }
+    }
+
+    // Invalidate cache entries for all affected files
+    {
+        if let Ok(mut cache) = state.cache.write() {
+            for rel_path in deleted.iter().chain(files_to_update.iter()) {
+                cache.pop(rel_path);
+            }
+        }
+    }
+
+    eprintln!(
+        "[trace] stale check: updated {} files in {:.1}ms (total: {:.1}ms)",
+        total_changes,
+        update_start.elapsed().as_secs_f64() * 1000.0,
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Persist the updated index immediately so changes survive a crash
+    eprintln!("[trace] stale check: flushing updated index to disk...");
+    flush_index_to_disk(state, root, index_dir);
+
+    // Re-stamp ALL walked files (including content-binary ones) so the
+    // next startup won't treat unchanged non-indexed files as "new".
+    let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
+        .iter()
+        .map(|fm| {
+            (
+                fm.relative_path.clone(),
+                FileStamp {
+                    mtime: fm.mtime,
+                    size: fm.size,
+                },
+            )
+        })
+        .collect();
+    if let Err(e) = meta::write_filestamps(&new_stamps, index_dir) {
+        eprintln!("[trace] stale check: failed to write filestamps: {e}");
+    }
+}
+
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
 /// Uses rayon for parallel trigram extraction. Flushes to disk every
 /// FLUSH_INTERVAL or FLUSH_FILE_THRESHOLD, whichever comes first.
@@ -945,6 +1089,25 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     eprintln!("[trace] persisting final index to disk...");
     flush_index_to_disk(state, root, index_dir);
 
+    // Write per-file stamps for ALL walked files (including content-binary
+    // ones) so the stale check on next startup is accurate.
+    let walk_meta = tgrep_core::walker::walk_file_metadata(root);
+    let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
+        .into_iter()
+        .map(|fm| {
+            (
+                fm.relative_path,
+                tgrep_core::meta::FileStamp {
+                    mtime: fm.mtime,
+                    size: fm.size,
+                },
+            )
+        })
+        .collect();
+    if let Err(e) = tgrep_core::meta::write_filestamps(&stamps, index_dir) {
+        eprintln!("[trace] warning: failed to write filestamps: {e}");
+    }
+
     // Clear indexing flag AFTER final flush so auto-save doesn't race
     state
         .indexing
@@ -1083,7 +1246,13 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
 /// Move index files from staging to the target directory.
 fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
-    for name in &["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+    for name in &[
+        "index.bin",
+        "lookup.bin",
+        "files.bin",
+        "meta.json",
+        "filestamps.json",
+    ] {
         let src = staging.join(name);
         let dst = target.join(name);
         if src.exists() {
