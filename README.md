@@ -266,14 +266,24 @@ cargo install --path tgrep-cli --locked
 Download from [GitHub Releases](https://github.com/microsoft/tgrep/releases)
 for Linux, macOS (Intel & Apple Silicon), and Windows.
 
-Or use the install scripts:
-
 ```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/microsoft/tgrep/main/scripts/install.sh | bash
+# Linux (x86_64)
+gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-gnu*' -D /tmp/tgrep-dl
+tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin
 
+# macOS (Apple Silicon)
+gh release download --repo microsoft/tgrep -p '*aarch64-apple-darwin*' -D /tmp/tgrep-dl
+tar xzf /tmp/tgrep-dl/tgrep-*-aarch64-apple-darwin.tar.gz -C /usr/local/bin
+
+# macOS (Intel)
+gh release download --repo microsoft/tgrep -p '*x86_64-apple-darwin*' -D /tmp/tgrep-dl
+tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-apple-darwin.tar.gz -C /usr/local/bin
+```
+
+```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/microsoft/tgrep/main/scripts/install.ps1 | iex
+gh release download --repo microsoft/tgrep -p '*windows*' -D $env:TEMP\tgrep-dl
+Expand-Archive $env:TEMP\tgrep-dl\tgrep-*-windows*.zip -DestinationPath $HOME\.cargo\bin -Force
 ```
 
 ## License
