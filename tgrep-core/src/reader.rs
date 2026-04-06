@@ -1,18 +1,21 @@
 /// Mmap-based read-only index reader.
 ///
-/// Uses memory-mapped files for zero-copy access to `lookup.bin` and
-/// `index.bin`. Binary searches the sorted lookup table to find
-/// posting lists for queried trigrams.
+/// Memory-maps `lookup.bin` for zero-copy binary search on the sorted
+/// trigram table. Reads posting lists from `index.bin` on demand to
+/// keep resident memory bounded — only the lookup table stays mapped.
 use memmap2::Mmap;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::Result;
 use crate::ondisk::{self, LOOKUP_ENTRY_SIZE, LookupEntry, POSTING_ENTRY_SIZE, PostingEntry};
 
 pub struct IndexReader {
     lookup: Option<Mmap>,
-    postings: Option<Mmap>,
+    /// Opened file handle for on-demand posting list reads (not mmap'd).
+    postings_file: Option<Mutex<File>>,
     file_paths: Vec<String>,
     num_entries: usize,
 }
@@ -31,20 +34,19 @@ impl IndexReader {
         let postings_meta = std::fs::metadata(&postings_path)?;
 
         // Handle empty index (no files indexed yet) — mmap requires non-zero length
-        let (lookup, postings, num_entries) = if lookup_meta.len() == 0 || postings_meta.len() == 0
-        {
-            (None, None, 0)
-        } else {
-            let lookup_file = File::open(&lookup_path)?;
-            let postings_file = File::open(&postings_path)?;
-            // SAFETY: Files are opened read-only and the Mmap lifetime is tied to
-            // IndexReader. The close() method drops the mappings before any file
-            // overwrites (required on Windows).
-            let lk = unsafe { Mmap::map(&lookup_file)? };
-            let pk = unsafe { Mmap::map(&postings_file)? };
-            let n = lk.len() / LOOKUP_ENTRY_SIZE;
-            (Some(lk), Some(pk), n)
-        };
+        let (lookup, postings_file, num_entries) =
+            if lookup_meta.len() == 0 || postings_meta.len() == 0 {
+                (None, None, 0)
+            } else {
+                let lookup_file = File::open(&lookup_path)?;
+                let pf = File::open(&postings_path)?;
+                // SAFETY: File is opened read-only and the Mmap lifetime is tied to
+                // IndexReader. The close() method drops the mapping before any file
+                // overwrites (required on Windows).
+                let lk = unsafe { Mmap::map(&lookup_file)? };
+                let n = lk.len() / LOOKUP_ENTRY_SIZE;
+                (Some(lk), Some(Mutex::new(pf)), n)
+            };
 
         // Load file paths
         let files_data = std::fs::read(&files_path)?;
@@ -58,7 +60,7 @@ impl IndexReader {
 
         Ok(Self {
             lookup,
-            postings,
+            postings_file,
             file_paths,
             num_entries,
         })
@@ -67,7 +69,7 @@ impl IndexReader {
     /// Release mmap handles so the underlying files can be overwritten (Windows).
     pub fn close(&mut self) {
         self.lookup = None;
-        self.postings = None;
+        self.postings_file = None;
         self.file_paths.clear();
         self.num_entries = 0;
     }
@@ -159,19 +161,27 @@ impl IndexReader {
     }
 
     fn read_posting_entries(&self, offset: u64, length: u32) -> Vec<PostingEntry> {
-        let postings = match self.postings.as_ref() {
-            Some(p) => p,
+        let file_mutex = match self.postings_file.as_ref() {
+            Some(f) => f,
             None => return Vec::new(),
         };
+        let byte_len = length as usize * POSTING_ENTRY_SIZE;
+        let mut buf = vec![0u8; byte_len];
+
+        let mut file = file_mutex.lock().unwrap();
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return Vec::new();
+        }
+        if file.read_exact(&mut buf).is_err() {
+            return Vec::new();
+        }
+
         let mut result = Vec::with_capacity(length as usize);
-        let start = offset as usize;
         for i in 0..length as usize {
-            let pos = start + i * POSTING_ENTRY_SIZE;
-            if pos + POSTING_ENTRY_SIZE <= postings.len() {
-                let buf: &[u8; POSTING_ENTRY_SIZE] =
-                    postings[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap();
-                result.push(PostingEntry::decode(buf));
-            }
+            let pos = i * POSTING_ENTRY_SIZE;
+            let entry_buf: &[u8; POSTING_ENTRY_SIZE] =
+                buf[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap();
+            result.push(PostingEntry::decode(entry_buf));
         }
         result
     }
