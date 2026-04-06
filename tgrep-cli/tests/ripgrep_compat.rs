@@ -537,3 +537,46 @@ fn with_filename_and_no_filename_last_wins() {
     assert!(!stdout.contains("hello.rs"));
     assert!(stdout.contains("fn main()"));
 }
+
+// ─── count-files ────────────────────────────────────────────────────
+
+#[test]
+fn count_files_reports_correct_count() {
+    let dir = setup_fixture();
+    let output = tgrep()
+        .args(["count-files", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Fixture has 4 text files: hello.rs, lib.rs, config.toml, notes.txt
+    assert_eq!(stdout.trim(), "4");
+}
+
+#[test]
+fn count_files_stderr_has_details() {
+    let dir = setup_fixture();
+    let output = tgrep()
+        .args(["count-files", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("4 text files"));
+    assert!(stderr.contains("binary skipped"));
+}
+
+#[test]
+fn count_files_skips_binary() {
+    let dir = setup_fixture();
+    // Add a binary file (by extension)
+    fs::write(dir.path().join("testdata").join("image.png"), b"\x89PNG\r\n").unwrap();
+    let output = tgrep()
+        .args(["count-files", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Still 4 text files — png is skipped
+    assert_eq!(stdout.trim(), "4");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1 binary skipped"));
+}
