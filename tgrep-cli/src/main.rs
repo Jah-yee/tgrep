@@ -10,6 +10,7 @@ mod output;
 mod search;
 mod serve;
 mod status;
+mod walkcount;
 
 use std::path::PathBuf;
 use std::process;
@@ -235,6 +236,13 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Count text files in a directory (fast walker, no indexing).
+    CountFiles {
+        /// Root directory to scan.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 impl Cli {
@@ -308,6 +316,7 @@ fn main() {
             ref path,
         }) => run_search(&cli, pattern.clone(), path),
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
+        Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, cli.no_ignore),
         None => {
             if cli.list_files {
                 let opts = cli.build_search_opts(String::new());
