@@ -675,3 +675,59 @@ fn index_exclude_multiple_dirs() {
     assert!(!stdout.contains("vendor"));
     assert!(!stdout.contains("third_party"));
 }
+
+// ─── serve lock ─────────────────────────────────────────────────────
+
+#[test]
+fn serve_rejects_second_server_on_same_index() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("hello.txt"), "hello world").unwrap();
+
+    let index_dir = dir.path().join("idx");
+
+    // Start first server in background using std::process::Command
+    let tgrep_bin = assert_cmd::cargo::cargo_bin("tgrep");
+    let mut server1 = std::process::Command::new(&tgrep_bin)
+        .args([
+            "serve",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-watch",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait for server1 to be ready (serve.json written)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !index_dir.join("serve.json").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server1 did not start in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Try to start second server on the same index — should fail
+    tgrep()
+        .args([
+            "serve",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-watch",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another tgrep server is already running",
+        ));
+
+    // Clean up: kill server1
+    server1.kill().ok();
+    server1.wait().ok();
+}

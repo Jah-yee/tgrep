@@ -2,6 +2,7 @@
 ///
 /// Keeps the trigram index in memory (HybridIndex), watches for filesystem
 /// changes, and serves search/status queries over TCP.
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
@@ -10,6 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use lru::LruCache;
 
 use anyhow::Result;
@@ -53,6 +55,33 @@ impl ServerInfo {
     }
 }
 
+/// Attempt to acquire an exclusive lock on `serve.lock` inside the index
+/// directory. Returns the held `File` (must be kept alive for the duration of
+/// the server) or an error with a user-friendly message when another server is
+/// already running.
+fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
+    std::fs::create_dir_all(index_dir)?;
+    let lock_path = index_dir.join("serve.lock");
+    let file = File::create(&lock_path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(_) => {
+            // Another server holds the lock — provide a helpful message.
+            let detail = if let Ok(info) = ServerInfo::load(index_dir) {
+                format!(" (pid {}, port {})", info.pid, info.port,)
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "another tgrep server is already running for index directory `{}`{}. \
+                 Stop the existing server before starting a new one.",
+                index_dir.display(),
+                detail,
+            );
+        }
+    }
+}
+
 struct ServerState {
     index: RwLock<HybridIndex>,
     cache: RwLock<LruCache<String, Arc<String>>>,
@@ -88,6 +117,10 @@ pub fn run(
     let index_dir = index_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));
+
+    // Ensure only one server runs per index directory.
+    // The lock file is held for the lifetime of the server and released on exit.
+    let _lock_file = try_acquire_server_lock(&index_dir)?;
 
     let has_index = index_dir.join("lookup.bin").exists();
 
