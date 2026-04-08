@@ -636,6 +636,9 @@ fn build_combined_regex(
         .case_insensitive(case_insensitive)
         .multi_line(multiline)
         .dot_matches_new_line(multiline)
+        .size_limit(10 * (1 << 20)) // 10 MB compiled regex limit
+        .dfa_size_limit(10 * (1 << 20)) // 10 MB DFA cache limit
+        .nest_limit(200)
         .build()
         .map_err(|e| anyhow::anyhow!("regex error: {e}"))
 }

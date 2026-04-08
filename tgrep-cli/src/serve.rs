@@ -390,6 +390,9 @@ fn handle_search(
         .case_insensitive(case_insensitive)
         .multi_line(multiline)
         .dot_matches_new_line(multiline)
+        .size_limit(10 * (1 << 20)) // 10 MB compiled regex limit
+        .dfa_size_limit(10 * (1 << 20)) // 10 MB DFA cache limit
+        .nest_limit(200)
         .build()
     {
         Ok(r) => r,
