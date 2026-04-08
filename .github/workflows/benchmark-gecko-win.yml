@@ -9,7 +9,7 @@ env:
 jobs:
   benchmark:
     name: Benchmark Gecko (Windows)
-    timeout-minutes: 120
+    timeout-minutes: 240
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

@@ -9,7 +9,7 @@ env:
 jobs:
   benchmark:
     name: Benchmark Gecko (${{ matrix.os }})
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
