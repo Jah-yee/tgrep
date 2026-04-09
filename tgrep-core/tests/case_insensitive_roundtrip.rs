@@ -1,19 +1,17 @@
 use std::collections::HashMap;
-use tgrep_core::{builder, query, reader, trigram};
+use tgrep_core::{builder, ngram, query, reader};
 
 #[test]
 fn case_insensitive_search_roundtrip() {
     let content = b"internal class AlertSchema : AlertBaseSchema";
 
-    // Extract trigrams (original + lowercase) just like builder/serve does
-    let mut file_tris = trigram::extract(content);
-    let lower = content.to_ascii_lowercase();
-    file_tris.extend(trigram::extract(&lower));
+    // Extract sparse n-grams (case-normalized) just like builder does
+    let ngram_masks = ngram::extract_for_indexing(content);
 
     // Build inverted index for file_id=0
     let mut inverted: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &tri in &file_tris {
-        inverted.entry(tri).or_default().push(0);
+    for &(hash, _) in &ngram_masks {
+        inverted.entry(hash).or_default().push(0);
     }
 
     // Write to temp directory
@@ -26,7 +24,7 @@ fn case_insensitive_search_roundtrip() {
     // Read back from disk
     let reader = reader::IndexReader::open(&tmp).unwrap();
     assert_eq!(reader.num_files(), 1);
-    assert!(reader.num_trigrams() > 0, "should have trigrams on disk");
+    assert!(reader.num_trigrams() > 0, "should have n-grams on disk");
 
     // Case-insensitive query via regex path (default, no -F)
     let plan = query::build_query_plan("class AlertSchema", true).unwrap();

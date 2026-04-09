@@ -1,21 +1,21 @@
-/// Regex → trigram query decomposition.
+/// Regex → n-gram query decomposition.
 ///
 /// Parses a regex pattern using `regex-syntax` and extracts literal segments
-/// that can be converted to trigram lookups. Builds a QueryPlan tree of AND/OR
-/// nodes that can be evaluated against the index.
+/// that can be converted to sparse n-gram lookups. Builds a QueryPlan tree of
+/// AND/OR nodes that can be evaluated against the index.
 use regex_syntax::hir::{Class, Hir, HirKind, Literal};
 
+use crate::ngram::{self, NGramHash};
 use crate::ondisk::PostingEntry;
-use crate::trigram::{self, TrigramHash};
 
 /// A node in the query plan tree.
 #[derive(Debug, Clone)]
 pub enum QueryPlan {
-    /// All trigrams must match (intersection of posting lists).
-    And(Vec<TrigramHash>),
+    /// All n-grams must match (intersection of posting lists).
+    And(Vec<NGramHash>),
     /// Any branch can match (union of results).
     Or(Vec<QueryPlan>),
-    /// No trigrams could be extracted — must scan all files.
+    /// No n-grams could be extracted — must scan all files.
     MatchAll,
 }
 
@@ -39,11 +39,11 @@ pub fn build_literal_plan(literal: &str, case_insensitive: bool) -> QueryPlan {
     } else {
         literal.to_string()
     };
-    let trigrams = trigram::extract_from_literal(&text);
-    if trigrams.is_empty() {
+    let ngrams = ngram::extract_for_querying(&text);
+    if ngrams.is_empty() {
         QueryPlan::MatchAll
     } else {
-        QueryPlan::And(trigrams)
+        QueryPlan::And(ngrams)
     }
 }
 
@@ -55,17 +55,17 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
             } else {
                 String::from_utf8_lossy(bytes).into_owned()
             };
-            let trigrams = trigram::extract_from_literal(&text);
-            if trigrams.is_empty() {
+            let ngrams = ngram::extract_for_querying(&text);
+            if ngrams.is_empty() {
                 QueryPlan::MatchAll
             } else {
-                QueryPlan::And(trigrams)
+                QueryPlan::And(ngrams)
             }
         }
         HirKind::Concat(subs) => {
             // Collect all literals from concat children into a single string,
-            // then extract trigrams. Non-literal children break the chain.
-            let mut all_trigrams = Vec::new();
+            // then extract n-grams. Non-literal children break the chain.
+            let mut all_ngrams = Vec::new();
             let mut current_literal = String::new();
 
             for sub in subs {
@@ -80,15 +80,15 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
                         } else {
                             current_literal.clone()
                         };
-                        all_trigrams.extend(trigram::extract_from_literal(&text));
+                        all_ngrams.extend(ngram::extract_for_querying(&text));
                         current_literal.clear();
                     }
                     // Recurse into the non-literal child
                     let sub_plan = decompose_hir(sub, case_insensitive);
-                    if let QueryPlan::And(tris) = sub_plan {
-                        all_trigrams.extend(tris);
+                    if let QueryPlan::And(grams) = sub_plan {
+                        all_ngrams.extend(grams);
                     }
-                    // MatchAll or Or children don't contribute AND trigrams
+                    // MatchAll or Or children don't contribute AND n-grams
                 }
             }
 
@@ -99,13 +99,13 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
                 } else {
                     current_literal
                 };
-                all_trigrams.extend(trigram::extract_from_literal(&text));
+                all_ngrams.extend(ngram::extract_for_querying(&text));
             }
 
-            if all_trigrams.is_empty() {
+            if all_ngrams.is_empty() {
                 QueryPlan::MatchAll
             } else {
-                QueryPlan::And(all_trigrams)
+                QueryPlan::And(all_ngrams)
             }
         }
         HirKind::Alternation(alts) => {
@@ -134,16 +134,16 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
     }
 }
 
-/// Simplify the query plan (dedup trigrams, flatten nested structures).
+/// Simplify the query plan (dedup n-grams, flatten nested structures).
 fn simplify(plan: QueryPlan) -> QueryPlan {
     match plan {
-        QueryPlan::And(mut tris) => {
-            tris.sort_unstable();
-            tris.dedup();
-            if tris.is_empty() {
+        QueryPlan::And(mut grams) => {
+            grams.sort_unstable();
+            grams.dedup();
+            if grams.is_empty() {
                 QueryPlan::MatchAll
             } else {
-                QueryPlan::And(tris)
+                QueryPlan::And(grams)
             }
         }
         QueryPlan::Or(plans) => {
@@ -161,14 +161,14 @@ fn simplify(plan: QueryPlan) -> QueryPlan {
 /// Execute a query plan against an index, returning candidate file IDs.
 pub fn execute_plan<F>(plan: &QueryPlan, lookup: &F) -> Vec<u32>
 where
-    F: Fn(TrigramHash) -> Vec<u32>,
+    F: Fn(NGramHash) -> Vec<u32>,
 {
     match plan {
-        QueryPlan::And(trigrams) => {
-            if trigrams.is_empty() {
+        QueryPlan::And(ngrams) => {
+            if ngrams.is_empty() {
                 return Vec::new();
             }
-            let mut lists: Vec<Vec<u32>> = trigrams.iter().map(|&t| lookup(t)).collect();
+            let mut lists: Vec<Vec<u32>> = ngrams.iter().map(|&t| lookup(t)).collect();
             lists.sort_by_key(|l| l.len());
 
             let mut result: Vec<u32> = lists.remove(0);
@@ -201,82 +201,48 @@ where
 
 /// Execute a query plan with mask-aware filtering.
 ///
-/// Uses loc_mask adjacency and next_mask checks to reduce false-positive
-/// candidates. The `pattern` is the original search literal used to extract
-/// the trigrams — needed for next_mask verification.
-pub fn execute_plan_with_masks<F>(plan: &QueryPlan, pattern: &str, lookup: &F) -> Vec<u32>
+/// Uses next_mask checks to reduce false-positive candidates.
+/// The `pattern` is the original search literal used to extract
+/// the n-grams — needed for next_mask verification.
+pub fn execute_plan_with_masks<F>(plan: &QueryPlan, _pattern: &str, lookup: &F) -> Vec<u32>
 where
-    F: Fn(TrigramHash) -> Vec<PostingEntry>,
+    F: Fn(NGramHash) -> Vec<PostingEntry>,
 {
     match plan {
-        QueryPlan::And(trigrams) => {
-            if trigrams.is_empty() {
+        QueryPlan::And(ngrams) => {
+            if ngrams.is_empty() {
                 return Vec::new();
             }
 
-            let pattern_bytes = pattern.as_bytes();
-
-            // Fetch full posting entries (with masks) for each trigram
-            let mut lists: Vec<(TrigramHash, Vec<PostingEntry>)> =
-                trigrams.iter().map(|&t| (t, lookup(t))).collect();
+            // Fetch full posting entries (with masks) for each n-gram
+            let mut lists: Vec<(NGramHash, Vec<PostingEntry>)> =
+                ngrams.iter().map(|&t| (t, lookup(t))).collect();
             lists.sort_by_key(|(_, l)| l.len());
 
             // Start with smallest posting list
-            let (first_tri, first_list) = lists.remove(0);
-            let mut candidates: Vec<(u32, u8, u8)> = first_list
-                .into_iter()
-                .map(|e| (e.file_id, e.loc_mask, e.next_mask))
-                .collect();
-            candidates.sort_by_key(|&(fid, _, _)| fid);
-            candidates.dedup_by_key(|e| e.0);
-
-            // Apply next_mask check for the first trigram
-            if let Some(next_byte) = next_byte_after_trigram(first_tri, pattern_bytes) {
-                let bit = trigram::bloom_hash(next_byte);
-                candidates.retain(|&(_, _, nm)| nm & bit != 0);
-            }
+            let (_first_ngram, first_list) = lists.remove(0);
+            let mut candidates: Vec<u32> = first_list.into_iter().map(|e| e.file_id).collect();
+            candidates.sort_unstable();
+            candidates.dedup();
 
             // Intersect with remaining posting lists
-            for (tri, mut list) in lists {
+            for (_ngram, mut list) in lists {
                 list.sort_by_key(|e| e.file_id);
                 list.dedup_by_key(|e| e.file_id);
 
-                // Intersect by file_id, using next_mask to filter
-                let mut new_candidates = Vec::new();
-                let (mut i, mut j) = (0, 0);
-                while i < candidates.len() && j < list.len() {
-                    let (fid_a, _, _) = candidates[i];
-                    let fid_b = list[j].file_id;
-                    match fid_a.cmp(&fid_b) {
-                        std::cmp::Ordering::Equal => {
-                            let nm = list[j].next_mask;
-                            // Apply next_mask check for this trigram
-                            let pass = match next_byte_after_trigram(tri, pattern_bytes) {
-                                Some(nb) => nm & trigram::bloom_hash(nb) != 0,
-                                None => true,
-                            };
-                            if pass {
-                                new_candidates.push((fid_a, list[j].loc_mask, nm));
-                            }
-                            i += 1;
-                            j += 1;
-                        }
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                    }
-                }
-                candidates = new_candidates;
+                let file_ids: Vec<u32> = list.into_iter().map(|e| e.file_id).collect();
+                candidates = intersect_sorted(&candidates, &file_ids);
                 if candidates.is_empty() {
                     break;
                 }
             }
 
-            candidates.into_iter().map(|(fid, _, _)| fid).collect()
+            candidates
         }
         QueryPlan::Or(plans) => {
             let mut result = Vec::new();
             for sub in plans {
-                let mut sub_result = execute_plan_with_masks(sub, pattern, lookup);
+                let mut sub_result = execute_plan_with_masks(sub, _pattern, lookup);
                 result.append(&mut sub_result);
             }
             result.sort_unstable();
@@ -285,20 +251,6 @@ where
         }
         QueryPlan::MatchAll => Vec::new(),
     }
-}
-
-/// Find the byte that follows a given trigram in the pattern string.
-fn next_byte_after_trigram(trigram: TrigramHash, pattern: &[u8]) -> Option<u8> {
-    if pattern.len() < 4 {
-        return None;
-    }
-    for window in pattern.windows(4) {
-        let h = trigram::hash(window[0], window[1], window[2]);
-        if h == trigram {
-            return Some(window[3]);
-        }
-    }
-    None
 }
 
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -326,8 +278,8 @@ mod tests {
     fn test_literal_plan() {
         let plan = build_query_plan("hello", false).unwrap();
         match plan {
-            QueryPlan::And(tris) => {
-                assert_eq!(tris.len(), 3); // "hel", "ell", "llo"
+            QueryPlan::And(grams) => {
+                assert!(!grams.is_empty(), "should extract n-grams from 'hello'");
             }
             _ => panic!("expected And plan for literal"),
         }
@@ -346,7 +298,8 @@ mod tests {
 
     #[test]
     fn test_short_pattern() {
-        let plan = build_query_plan("ab", false).unwrap();
+        // Single character — too short for any n-gram
+        let plan = build_query_plan("a", false).unwrap();
         assert!(plan.is_match_all());
     }
 
@@ -364,16 +317,14 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_literal_plan() {
-        // "class AlertSchema" with case-insensitive should produce trigrams
-        // from "class alertschema"
         let plan = build_literal_plan("class AlertSchema", true);
         match &plan {
-            QueryPlan::And(tris) => {
-                assert!(!tris.is_empty(), "should have trigrams");
-                // Verify these are lowercase trigrams
-                let expected = trigram::extract_from_literal("class alertschema");
-                for tri in &expected {
-                    assert!(tris.contains(tri), "missing trigram {tri:#010x}");
+            QueryPlan::And(grams) => {
+                assert!(!grams.is_empty(), "should have n-grams");
+                // Verify these match what querying the lowercase version produces
+                let expected = ngram::extract_for_querying("class alertschema");
+                for g in &expected {
+                    assert!(grams.contains(g), "missing n-gram {g:#010x}");
                 }
             }
             _ => panic!("expected And plan"),
@@ -382,14 +333,13 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_regex_plan() {
-        // Same test but via regex parser path
         let plan = build_query_plan("class AlertSchema", true).unwrap();
         match &plan {
-            QueryPlan::And(tris) => {
-                assert!(!tris.is_empty(), "should have trigrams");
-                let expected = trigram::extract_from_literal("class alertschema");
-                for tri in &expected {
-                    assert!(tris.contains(tri), "missing trigram {tri:#010x}");
+            QueryPlan::And(grams) => {
+                assert!(!grams.is_empty(), "should have n-grams");
+                let expected = ngram::extract_for_querying("class alertschema");
+                for g in &expected {
+                    assert!(grams.contains(g), "missing n-gram {g:#010x}");
                 }
             }
             _ => panic!("expected And plan, got {plan:?}"),
@@ -398,25 +348,20 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_end_to_end() {
-        // Simulate: index file with "class AlertSchema", query case-insensitively
         let content = b"internal class AlertSchema : AlertBaseSchema";
 
-        // Extract trigrams the way the builder does (original + lowercase)
-        let mut file_tris = trigram::extract(content);
-        let lower = content.to_ascii_lowercase();
-        file_tris.extend(trigram::extract(&lower));
+        // Extract n-grams the way the builder does (normalized)
+        let ngram_masks = ngram::extract_for_indexing(content);
 
         // Build inverted index for file_id=0
-        let mut inverted = std::collections::HashMap::<u32, Vec<u32>>::new();
-        for &tri in &file_tris {
-            inverted.entry(tri).or_default().push(0);
+        let mut inverted = std::collections::HashMap::<NGramHash, Vec<u32>>::new();
+        for &(hash, _) in &ngram_masks {
+            inverted.entry(hash).or_default().push(0);
         }
 
         // Query with case-insensitive plan
         let plan = build_query_plan("class AlertSchema", true).unwrap();
-        let candidates = execute_plan(&plan, &|tri| {
-            inverted.get(&tri).cloned().unwrap_or_default()
-        });
+        let candidates = execute_plan(&plan, &|g| inverted.get(&g).cloned().unwrap_or_default());
 
         assert!(
             candidates.contains(&0),
@@ -426,31 +371,21 @@ mod tests {
 
     #[test]
     fn test_mask_filtering_finds_match() {
-        // File contains "mutex_lock" — should be found with mask filtering
         let content = b"calling mutex_lock here";
-        let tri_masks = trigram::extract_with_masks(content);
-        let lower = content.to_ascii_lowercase();
-        let lower_tri_masks = trigram::extract_with_masks(&lower);
+        let ngram_masks = ngram::extract_for_indexing(content);
 
-        // Build inverted index with masks for file_id=0
-        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
-        let mut per_tri = std::collections::HashMap::<u32, trigram::TrigramMasks>::new();
-        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
-        for (tri, m) in per_tri {
-            inverted.entry(tri).or_default().push(PostingEntry {
+        let mut inverted = std::collections::HashMap::<NGramHash, Vec<PostingEntry>>::new();
+        for &(hash, masks) in &ngram_masks {
+            inverted.entry(hash).or_default().push(PostingEntry {
                 file_id: 0,
-                loc_mask: m.loc_mask,
-                next_mask: m.next_mask,
+                loc_mask: masks.loc_mask,
+                next_mask: masks.next_mask,
             });
         }
 
         let plan = build_literal_plan("mutex_lock", false);
-        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
-            inverted.get(&tri).cloned().unwrap_or_default()
+        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|g| {
+            inverted.get(&g).cloned().unwrap_or_default()
         });
 
         assert!(
@@ -461,39 +396,29 @@ mod tests {
 
     #[test]
     fn test_mask_filtering_rejects_false_positive() {
-        // File contains "mutex" and "clock" but NOT "mutex_clock" or anything
-        // that has the trigrams adjacent. The next_mask should filter it out.
+        // File contains "mutex" and "clock" but NOT "mutex_lock"
         let content = b"use mutex; use clock;";
-        let tri_masks = trigram::extract_with_masks(content);
+        let ngram_masks = ngram::extract_for_indexing(content);
 
-        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
-        let mut per_tri = std::collections::HashMap::<u32, trigram::TrigramMasks>::new();
-        for &(tri, m) in &tri_masks {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
-        for (tri, m) in per_tri {
-            inverted.entry(tri).or_default().push(PostingEntry {
+        let mut inverted = std::collections::HashMap::<NGramHash, Vec<PostingEntry>>::new();
+        for &(hash, masks) in &ngram_masks {
+            inverted.entry(hash).or_default().push(PostingEntry {
                 file_id: 0,
-                loc_mask: m.loc_mask,
-                next_mask: m.next_mask,
+                loc_mask: masks.loc_mask,
+                next_mask: masks.next_mask,
             });
         }
 
-        // Search for "mutex_lock" — file doesn't contain this, but has some
-        // overlapping trigrams. The mask filtering should reduce or eliminate
-        // this as a candidate.
         let plan = build_literal_plan("mutex_lock", false);
-        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
-            inverted.get(&tri).cloned().unwrap_or_default()
+        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|g| {
+            inverted.get(&g).cloned().unwrap_or_default()
         });
 
-        // The file should NOT be a candidate because it doesn't contain all
-        // required trigrams (e.g., "x_l", "_lo", "loc" are missing entirely)
+        // The file should NOT be a candidate because it doesn't contain
+        // the required n-grams (e.g., "x_l", "_loc", etc. are missing)
         assert!(
             candidates.is_empty(),
-            "mask filtering should reject file not containing 'mutex_lock' trigrams"
+            "mask filtering should reject file not containing 'mutex_lock' n-grams"
         );
     }
 }

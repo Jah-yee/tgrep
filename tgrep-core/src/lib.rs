@@ -4,6 +4,7 @@ pub mod filetypes;
 pub mod hybrid;
 pub mod live;
 pub mod meta;
+pub mod ngram;
 pub(crate) mod ondisk;
 pub mod query;
 pub mod reader;

@@ -1,4 +1,4 @@
-/// Index builder: walks a repo, extracts trigrams, writes the on-disk index.
+/// Index builder: walks a repo, extracts sparse n-grams, writes the on-disk index.
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Write;
@@ -6,8 +6,8 @@ use std::path::Path;
 
 use crate::Result;
 use crate::meta::{self, IndexMeta};
+use crate::ngram::{self, NGramHash, NGramMasks};
 use crate::ondisk::{self, LookupEntry, PostingEntry};
-use crate::trigram::{self, TrigramMasks};
 use crate::walker;
 
 const INDEX_DIR_NAME: &str = ".tgrep";
@@ -42,17 +42,17 @@ pub fn build_index(
         walk.skipped_error
     );
 
-    // Read all files and extract trigrams with masks in parallel.
+    // Read all files and extract sparse n-grams with masks in parallel.
     // Binary content check is done here (not in walker) to avoid an extra
     // 8KB read per file — we're already reading the full file anyway.
-    eprintln!("Extracting trigrams...");
+    eprintln!("Extracting n-grams...");
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
-    let file_data: Vec<(String, Vec<(u32, TrigramMasks)>)> = walk
+    let file_data: Vec<(String, Vec<(NGramHash, NGramMasks)>)> = walk
         .files
         .par_iter()
         .filter_map(|path| {
             let data = std::fs::read(path).ok()?;
-            if trigram::is_binary(&data) {
+            if ngram::is_binary(&data) {
                 binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
@@ -61,14 +61,9 @@ pub fn build_index(
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            // Extract trigrams with masks from both original and lowercased content
-            let mut tri_masks = trigram::extract_with_masks(&data);
-            let lower = data.to_ascii_lowercase();
-            if lower != data {
-                let lower_tris = trigram::extract_with_masks(&lower);
-                tri_masks.extend(lower_tris);
-            }
-            Some((rel, tri_masks))
+            // Extract sparse n-grams from normalized content
+            let ngram_masks = ngram::extract_for_indexing(&data);
+            Some((rel, ngram_masks))
         })
         .collect();
     let extra_binary = binary_skipped.into_inner();
@@ -81,24 +76,15 @@ pub fn build_index(
 
     // Assign file IDs and build inverted index with masks
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(file_data.len());
-    // trigram → Vec<(file_id, loc_mask, next_mask)>
-    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    // ngram_hash → Vec<PostingEntry>
+    let mut inverted: HashMap<NGramHash, Vec<PostingEntry>> = HashMap::new();
 
-    for (id, (path, tri_masks)) in file_data.iter().enumerate() {
+    for (id, (path, ngram_masks)) in file_data.iter().enumerate() {
         let file_id = id as u32;
         file_id_map.push((file_id, path.clone()));
 
-        // Merge masks per trigram for this file (a trigram may appear from
-        // both original and lowercase extraction)
-        let mut per_tri: HashMap<u32, TrigramMasks> = HashMap::new();
-        for &(tri, masks) in tri_masks {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= masks.loc_mask;
-            entry.next_mask |= masks.next_mask;
-        }
-
-        for (tri, masks) in per_tri {
-            inverted.entry(tri).or_default().push(PostingEntry {
+        for &(ngram_hash, masks) in ngram_masks {
+            inverted.entry(ngram_hash).or_default().push(PostingEntry {
                 file_id,
                 loc_mask: masks.loc_mask,
                 next_mask: masks.next_mask,
@@ -143,22 +129,21 @@ pub fn write_index_from_snapshot(
 ) -> Result<()> {
     std::fs::create_dir_all(index_dir)?;
 
-    let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
-    sorted_trigrams.sort_unstable();
+    let mut sorted_ngrams: Vec<u32> = inverted.keys().copied().collect();
+    sorted_ngrams.sort_unstable();
 
-    // Write index.bin — v2 posting entries with zero masks (still benefits from
-    // the v2 reader, and a subsequent `tgrep index` will compute real masks).
+    // Write index.bin — posting entries with all-ones masks (no filtering).
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
-    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_ngrams.len());
     let mut offset: u64 = 0;
 
-    for &tri in &sorted_trigrams {
-        let posting_list = inverted.get(&tri).unwrap();
+    for &ngram in &sorted_ngrams {
+        let posting_list = inverted.get(&ngram).unwrap();
         let length = posting_list.len() as u32;
 
         lookup_entries.push(LookupEntry {
-            trigram: tri,
+            trigram: ngram,
             offset,
             length,
         });
@@ -191,12 +176,12 @@ pub fn write_index_from_snapshot(
     }
     files_file.flush()?;
 
-    // Write meta.json (version 2 for mask-aware format)
+    // Write meta.json
     let root = std::fs::canonicalize(root)?;
     let mut meta_obj = IndexMeta::new(
         &root.to_string_lossy(),
         paths.len() as u64,
-        sorted_trigrams.len() as u64,
+        sorted_ngrams.len() as u64,
     );
     meta_obj.complete = complete;
     meta_obj.save(index_dir)?;
@@ -209,28 +194,28 @@ fn write_index_v2(
     index_dir: &Path,
     root: &Path,
     file_id_map: &[(u32, String)],
-    inverted: &HashMap<u32, Vec<PostingEntry>>,
+    inverted: &HashMap<NGramHash, Vec<PostingEntry>>,
 ) -> Result<()> {
-    let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
-    sorted_trigrams.sort_unstable();
+    let mut sorted_ngrams: Vec<NGramHash> = inverted.keys().copied().collect();
+    sorted_ngrams.sort_unstable();
 
     eprintln!(
-        "Writing index ({} trigrams, {} files)...",
-        sorted_trigrams.len(),
+        "Writing index ({} n-grams, {} files)...",
+        sorted_ngrams.len(),
         file_id_map.len()
     );
 
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
-    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_ngrams.len());
     let mut offset: u64 = 0;
 
-    for &tri in &sorted_trigrams {
-        let posting_list = inverted.get(&tri).unwrap();
+    for &ngram in &sorted_ngrams {
+        let posting_list = inverted.get(&ngram).unwrap();
         let length = posting_list.len() as u32;
 
         lookup_entries.push(LookupEntry {
-            trigram: tri,
+            trigram: ngram,
             offset,
             length,
         });
@@ -259,7 +244,7 @@ fn write_index_v2(
     let meta = IndexMeta::new(
         &root.to_string_lossy(),
         file_id_map.len() as u64,
-        sorted_trigrams.len() as u64,
+        sorted_ngrams.len() as u64,
     );
     meta.save(index_dir)?;
 

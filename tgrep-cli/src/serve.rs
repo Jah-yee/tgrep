@@ -1038,12 +1038,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Phase 2: Process new files in parallel batches
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
-        // Parallel: read files + extract trigrams (no locks held)
+        // Parallel: read files + extract n-grams (no locks held)
         let batch_results: Vec<(String, Vec<u32>)> = batch
             .par_iter()
             .filter_map(|path| {
                 let data = std::fs::read(path).ok()?;
-                if tgrep_core::trigram::is_binary(&data) {
+                if tgrep_core::ngram::is_binary(&data) {
                     return None;
                 }
                 let rel_path = path
@@ -1052,20 +1052,19 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                     .to_string_lossy()
                     .replace('\\', "/");
 
-                let mut trigrams = tgrep_core::trigram::extract(&data);
-                let lower = data.to_ascii_lowercase();
-                if lower != data {
-                    trigrams.extend(tgrep_core::trigram::extract(&lower));
-                }
-                Some((rel_path, trigrams))
+                let ngrams: Vec<u32> = tgrep_core::ngram::extract_for_indexing(&data)
+                    .into_iter()
+                    .map(|(hash, _)| hash)
+                    .collect();
+                Some((rel_path, ngrams))
             })
             .collect();
 
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {
             let mut index = state.index.write().unwrap();
-            for (rel_path, trigrams) in batch_results {
-                index.live.upsert_file_with_trigrams(&rel_path, trigrams);
+            for (rel_path, ngrams) in batch_results {
+                index.live.upsert_file_with_ngrams(&rel_path, ngrams);
             }
         }
 

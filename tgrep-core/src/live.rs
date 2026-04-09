@@ -1,4 +1,4 @@
-/// LiveIndex: a mutable, in-memory trigram index overlay.
+/// LiveIndex: a mutable, in-memory n-gram index overlay.
 ///
 /// Used by the server to track files that have changed since the on-disk
 /// index was built. Supports insert, update, and delete operations.
@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::ngram::{self, NGramHash, NGramMasks};
 use crate::ondisk::PostingEntry;
-use crate::trigram;
 
 /// Bit flag to distinguish live index file IDs from reader file IDs.
 pub const OVERLAY_BIT: u32 = 1 << 31;
@@ -15,7 +15,7 @@ pub const OVERLAY_BIT: u32 = 1 << 31;
 /// Raw clone of LiveIndex data for background checkpoint processing.
 /// Allows the expensive ID remapping to happen outside any lock.
 pub struct RawIndexSnapshot {
-    pub inverted: HashMap<u32, HashSet<u32>>,
+    pub inverted: HashMap<NGramHash, HashSet<u32>>,
     pub file_paths: HashMap<u32, String>,
 }
 
@@ -27,10 +27,10 @@ impl RawIndexSnapshot {
 }
 
 pub struct LiveIndex {
-    /// Trigram → set of file IDs (with OVERLAY_BIT set).
-    inverted: HashMap<u32, HashSet<u32>>,
-    /// Per-(trigram, file_id) masks for mask-aware filtering.
-    masks: HashMap<(u32, u32), trigram::TrigramMasks>,
+    /// NGram hash → set of file IDs (with OVERLAY_BIT set).
+    inverted: HashMap<NGramHash, HashSet<u32>>,
+    /// Per-(ngram_hash, file_id) masks for mask-aware filtering.
+    masks: HashMap<(NGramHash, u32), NGramMasks>,
     /// File ID → relative path.
     file_paths: HashMap<u32, String>,
     /// Path → file ID (for updates/deletes).
@@ -72,22 +72,12 @@ impl LiveIndex {
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
 
-        // Extract trigrams with masks
-        let tri_masks = trigram::extract_with_masks(content);
-        let lower = content.to_ascii_lowercase();
-        let lower_tri_masks = trigram::extract_with_masks(&lower);
+        // Extract sparse n-grams with masks (already case-normalized)
+        let ngram_masks = ngram::extract_for_indexing(content);
 
-        // Merge masks per trigram
-        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
-        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
-
-        for (tri, m) in per_tri {
-            self.inverted.entry(tri).or_default().insert(file_id);
-            self.masks.insert((tri, file_id), m);
+        for (hash, m) in ngram_masks {
+            self.inverted.entry(hash).or_default().insert(file_id);
+            self.masks.insert((hash, file_id), m);
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
@@ -96,11 +86,11 @@ impl LiveIndex {
         self.dirty_count += 1;
     }
 
-    /// Insert or update a file with pre-computed trigrams.
-    /// This avoids extracting trigrams while holding the write lock.
+    /// Insert or update a file with pre-computed n-gram hashes.
+    /// This avoids extracting n-grams while holding the write lock.
     /// Note: masks are set to all-ones (no filtering) since pre-computed
-    /// trigrams don't include mask data.
-    pub fn upsert_file_with_trigrams(&mut self, rel_path: &str, trigrams: Vec<u32>) {
+    /// n-grams don't include mask data.
+    pub fn upsert_file_with_ngrams(&mut self, rel_path: &str, ngrams: Vec<NGramHash>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
             self.remove_file_by_id(old_id);
@@ -109,11 +99,11 @@ impl LiveIndex {
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
 
-        for &tri in &trigrams {
-            self.inverted.entry(tri).or_default().insert(file_id);
+        for &hash in &ngrams {
+            self.inverted.entry(hash).or_default().insert(file_id);
             self.masks.insert(
-                (tri, file_id),
-                trigram::TrigramMasks {
+                (hash, file_id),
+                NGramMasks {
                     loc_mask: u8::MAX,
                     next_mask: u8::MAX,
                 },
@@ -135,27 +125,29 @@ impl LiveIndex {
         self.dirty_count += 1;
     }
 
-    /// Look up a trigram in the live overlay (file IDs only).
-    pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
+    /// Look up an n-gram in the live overlay (file IDs only).
+    pub fn lookup_trigram(&self, ngram_hash: NGramHash) -> Vec<u32> {
         self.inverted
-            .get(&trigram)
+            .get(&ngram_hash)
             .map(|set| set.iter().copied().collect())
             .unwrap_or_default()
     }
 
-    /// Look up a trigram with masks in the live overlay.
-    pub fn lookup_trigram_with_masks(&self, trigram: u32) -> Vec<PostingEntry> {
+    /// Look up an n-gram with masks in the live overlay.
+    pub fn lookup_trigram_with_masks(&self, ngram_hash: NGramHash) -> Vec<PostingEntry> {
         self.inverted
-            .get(&trigram)
+            .get(&ngram_hash)
             .map(|set| {
                 set.iter()
                     .map(|&fid| {
-                        let m = self.masks.get(&(trigram, fid)).copied().unwrap_or(
-                            trigram::TrigramMasks {
+                        let m = self
+                            .masks
+                            .get(&(ngram_hash, fid))
+                            .copied()
+                            .unwrap_or(NGramMasks {
                                 loc_mask: u8::MAX,
                                 next_mask: u8::MAX,
-                            },
-                        );
+                            });
                         PostingEntry {
                             file_id: fid,
                             loc_mask: m.loc_mask,
@@ -187,7 +179,7 @@ impl LiveIndex {
         self.file_paths.len()
     }
 
-    /// Number of unique trigrams in the overlay.
+    /// Number of unique n-grams in the overlay.
     pub fn num_trigrams(&self) -> usize {
         self.inverted.len()
     }
@@ -215,7 +207,7 @@ impl LiveIndex {
     }
 
     /// Get a reference to the inverted index.
-    pub fn inverted_index(&self) -> &HashMap<u32, HashSet<u32>> {
+    pub fn inverted_index(&self) -> &HashMap<NGramHash, HashSet<u32>> {
         &self.inverted
     }
 
@@ -229,7 +221,7 @@ impl LiveIndex {
         let full_path = root.join(rel_path);
         match std::fs::read(&full_path) {
             Ok(data) => {
-                if trigram::is_binary(&data) {
+                if ngram::is_binary(&data) {
                     self.delete_file(rel_path);
                 } else {
                     self.upsert_file(rel_path, &data);
@@ -259,7 +251,7 @@ impl LiveIndex {
 
     /// Remap raw data into disk-ready format (sequential IDs, sorted postings).
     pub(crate) fn remap_snapshot(
-        inverted: &HashMap<u32, HashSet<u32>>,
+        inverted: &HashMap<NGramHash, HashSet<u32>>,
         file_paths: &HashMap<u32, String>,
     ) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
         let mut pairs: Vec<_> = file_paths.iter().collect();
