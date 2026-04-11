@@ -244,10 +244,10 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 - tgrep's advantage grows with repo size — the trigram index eliminates scanning files that can't match
 - On the 493K-file Chromium repo, tgrep is up to **21x faster** (macOS) and **10x faster** (Windows)
 - On the 388K-file gecko-dev repo, tgrep is up to **98x faster** (macOS) and **25x faster** (Windows)
-- On the 93K-file Linux kernel, tgrep is **4x faster** on Windows, ~1.5x on macOS
+- On the 93K-file Linux kernel, tgrep is **4x faster** on Windows, ~1.5x on macOS, but Linux x86_64 is a case where ripgrep can be faster
 - On the 59K-file Rust repo, tgrep is **8x faster** on Windows, ~1.6–1.8x on macOS/Linux
 - On the 29K-file Kubernetes repo, tgrep is **10x faster** on Windows, ~2–2.5x on macOS/Linux
 - On the 15K-file Go repo, tgrep is **9.5x faster** on Windows, ~2–4x on macOS/Linux
 - On Windows, tgrep consistently shows the largest speedups (8–25x) due to slower Windows I/O
-- On Linux, aggressive OS page caching narrows the gap, but tgrep is still **1.8–4x faster**
+- On Linux, aggressive OS page caching often narrows the gap; tgrep is usually faster, but some repos (such as the Linux kernel on x86_64) can favor ripgrep
 - Index build is a one-time cost; the server watches for file changes and updates incrementally
